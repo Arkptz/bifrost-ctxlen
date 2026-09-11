@@ -28,6 +28,7 @@ package plugin
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"strconv"
 	"sync/atomic"
 
@@ -173,9 +174,7 @@ func (p *Plugin) PreRequestHook(ctx *schemas.BifrostContext, req *schemas.Bifros
 
 	existing, _ := ctx.Value(schemas.BifrostContextKeyRequestHeaders).(map[string]string)
 	headers := make(map[string]string, len(existing)+1)
-	for k, v := range existing {
-		headers[k] = v
-	}
+	maps.Copy(headers, existing)
 	// Keys are lowercased by the transport, and the routing engine lowercases
 	// both sides before matching; keep that invariant.
 	headers[p.Header()] = value
