@@ -66,7 +66,7 @@ const (
 	// 765 for a 1024x1024 at detail=high (max 1445 for the tile family),
 	// Anthropic ceil(w/28)*ceil(h/28) capped at 1568 on the standard tier,
 	// Gemini 258 per 768px tile or a flat 1120 on Gemini 3. Sizing the request
-	// by bytes therefore mis-measures images in BOTH directions: a 1 MB inline
+	// by bytes therefore misjudges images in BOTH directions: a 1 MB inline
 	// image is ~1.4 MB of base64 and would score ~350k tokens instead of ~1k,
 	// while an 80-character https:// URL would score ~20 for the same picture.
 	// The first inflation is what makes a byte-counting estimate dangerous —
@@ -128,6 +128,10 @@ func New() *Plugin {
 // struct — so each field is type-asserted defensively. A malformed value is
 // reported rather than ignored: silently falling back to a default makes a typo
 // in the admin UI look exactly like the setting being honoured.
+//
+// Unknown keys pass without complaint on purpose: the same object is where a
+// host reads its own per-plugin settings, so rejecting what this plugin does
+// not recognise would reject the host's.
 func (p *Plugin) Init(config any) error {
 	if config == nil {
 		return nil

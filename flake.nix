@@ -21,7 +21,11 @@
         "x86_64-darwin"
       ];
 
-      perSystem = {system, ...}: let
+      perSystem = {
+        system,
+        config,
+        ...
+      }: let
         # nixpkgs ships 1.27 as a release candidate, and Go orders "1.27rc2"
         # BEFORE "1.27.0", so every module declaring `go 1.27.0` — which
         # bifrost's do — is rejected with "requires go >= 1.27.0 (running
@@ -49,14 +53,18 @@
         };
 
         pname = "bifrost-ctxlen";
-        version = "0.1.0";
+        version = "0.3.0";
 
         # vendorHash covers the whole dependency tree. Refresh it with:
         #   nix build 2>&1 | grep 'got:' | awk '{print $2}'
-        vendorHash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        vendorHash = "sha256-yGQhXLfUp1+kchmfK6dDyswyqSsvdFEAK9HRSlqoKUk=";
       in {
-        # Eval-only placeholder — real build/test/lint run via lefthook / CI.
+        # `nix flake check` only EVALUATES packages.default — it never builds
+        # it — so a check that does not depend on the package is green while
+        # `nix build` fails. Referencing the package here is what makes the
+        # gate able to fail at all.
         checks.build-check = pkgs.runCommand "build-check" {} ''
+          test -f ${config.packages.default}/lib/${pname}.so
           touch $out
         '';
 
@@ -67,7 +75,12 @@
         # configurePhase sets up the vendor tree, and GOFLAGS carries -trimpath,
         # which feeds the package hashes the plugin runtime compares against the
         # host. Override those and the .so stops loading.
-        packages.default = pkgs.buildGoModule {
+        # buildGoModule is a hard ALIAS for the current default toolchain
+        # (buildGo126Module today) and never consults `pkgs.go`, so the overlay
+        # above does not reach it: the overridden builder is what actually
+        # compiles with 1.27.0. Verified by reading `go` out of the derivation's
+        # nativeBuildInputs.
+        packages.default = (pkgs.buildGoModule.override {go = pkgs.go_1_27;}) {
           inherit pname version vendorHash;
           src = ./.;
 
