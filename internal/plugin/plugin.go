@@ -1,5 +1,5 @@
-// Package plugin flags large-context requests so Bifrost's routing rules can
-// send them somewhere that handles them.
+// Package plugin reports a request's estimated context size so Bifrost's
+// routing rules can decide where to send it.
 //
 // Bifrost's routing rules are CEL expressions over a FIXED set of variables,
 // built by one hardcoded cel.NewEnv() in the routing plugin; nothing lets a
@@ -8,10 +8,17 @@
 //
 // What a plugin CAN do is write into the request-headers map the routing plugin
 // already reads to populate its `headers[...]` variable. So this measures the
-// request, sets a header, and leaves the actual routing decision in the admin
-// UI where it belongs:
+// request, publishes the NUMBER, and leaves every threshold in the admin UI:
 //
-//	headers["x-ctx-large"] == "1"   ->  some long-context provider
+//	int(headers["x-ctx-tokens"]) > 500000   ->  a long-context provider
+//	int(headers["x-ctx-tokens"]) > 900000   ->  something bigger still
+//
+// Publishing the count rather than a yes/no flag is deliberate. A boolean bakes
+// one threshold into the plugin, so changing it — or adding a second tier —
+// means editing the config, and every rule can only ever ask the one question
+// the plugin already decided. A number lets rules ask their own questions, and
+// as many as they like, with no plugin change at all. CEL's int() conversion on
+// this build was verified against the live gateway before committing to it.
 //
 // The behaviour lives in this importable package rather than in the root
 // `package main`, which is only the shim exporting symbols for plugin.Open.
@@ -21,6 +28,7 @@ package plugin
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"sync/atomic"
 
 	"github.com/maximhq/bifrost/core/schemas"
@@ -31,15 +39,11 @@ import (
 const Name = "ctxlen"
 
 const (
-	// defaultThresholdTokens is where "large" starts. 500k sits above the 200k
-	// window of the common Anthropic-family models, so anything past it is
-	// already in territory a normal provider cannot serve.
-	defaultThresholdTokens = 500_000
-
-	// defaultHeader is the header written into the context for CEL to match.
+	// defaultHeader carries the estimated token count, as a decimal string —
+	// header values are strings, and CEL's int() converts on the rule side.
 	// The `x-` prefix marks it as non-standard, and the name is deliberately
 	// specific: a generic one risks colliding with something a client sends.
-	defaultHeader = "x-ctx-large"
+	defaultHeader = "x-ctx-tokens"
 
 	// bytesPerToken converts serialized request size to an approximate token
 	// count. Four is the usual rule of thumb for English text and the same
@@ -54,33 +58,34 @@ const (
 	bytesPerToken = 4
 )
 
-// Plugin flags requests whose estimated size crosses a threshold.
+// Plugin measures requests and publishes the estimate.
 //
-// Every field a hook reads is atomic because PUT /api/plugins/<name> rewrites
-// the config of a LIVE plugin while it is serving requests: plain struct fields
-// would be a data race.
+// The header name is atomic because PUT /api/plugins/<name> rewrites the config
+// of a LIVE plugin while it is serving requests: a plain struct field would be
+// a data race.
 type Plugin struct {
-	threshold atomic.Int64
-	header    atomic.Value // string
+	header atomic.Value // string
 }
 
 // New returns a plugin with defaults applied. Init may override them.
 func New() *Plugin {
 	p := &Plugin{}
-	p.threshold.Store(defaultThresholdTokens)
 	p.header.Store(defaultHeader)
 	return p
 }
 
 // Init applies the config stored in bifrost's `config_plugins.config_json`:
 //
-//	{"threshold_tokens": 500000, "header": "x-ctx-large"}
+//	{"header": "x-ctx-tokens"}
+//
+// There is no threshold to configure: the plugin reports the measurement and
+// the rules decide what counts as large, so a new tier is a new rule rather
+// than a config change plus a restart.
 //
 // The value arrives as a raw map — the .so loader cannot unmarshal into a typed
-// struct — so each field is type-asserted defensively. JSON numbers decode as
-// float64, hence the conversion. A malformed value is reported rather than
-// ignored: silently falling back to a default makes a typo in the admin UI look
-// exactly like the setting being honoured.
+// struct — so each field is type-asserted defensively. A malformed value is
+// reported rather than ignored: silently falling back to a default makes a typo
+// in the admin UI look exactly like the setting being honoured.
 func (p *Plugin) Init(config any) error {
 	if config == nil {
 		return nil
@@ -89,17 +94,6 @@ func (p *Plugin) Init(config any) error {
 	cfg, ok := config.(map[string]any)
 	if !ok {
 		return fmt.Errorf("%s: config must be an object, got %T", Name, config)
-	}
-
-	if raw, present := cfg["threshold_tokens"]; present {
-		threshold, ok := raw.(float64)
-		if !ok {
-			return fmt.Errorf("%s: threshold_tokens must be a number, got %T", Name, raw)
-		}
-		if threshold <= 0 {
-			return fmt.Errorf("%s: threshold_tokens must be positive, got %v", Name, threshold)
-		}
-		p.threshold.Store(int64(threshold))
 	}
 
 	if raw, present := cfg["header"]; present {
@@ -115,9 +109,6 @@ func (p *Plugin) Init(config any) error {
 
 	return nil
 }
-
-// Threshold returns the configured token threshold.
-func (p *Plugin) Threshold() int64 { return p.threshold.Load() }
 
 // Header returns the configured header name.
 func (p *Plugin) Header() string {
@@ -159,17 +150,17 @@ func (p *Plugin) EstimateTokens(req *schemas.BifrostRequest) int64 {
 	return int64(len(encoded)) / bytesPerToken
 }
 
-// PreRequestHook measures the request and records the verdict as a header.
+// PreRequestHook measures the request and publishes the estimate as a header.
 //
 // Registration must set "placement": "pre_builtin", otherwise this runs AFTER
 // the routing plugin and the header arrives too late to affect anything.
 //
 // Two details matter more than they look:
 //
-// The header is written on EVERY request, including a "0" for small ones. The
-// map starts as a copy of the client's own headers, so a value set only when
-// the request is large would let any caller send `x-ctx-large: 1` and route
-// itself. Overwriting unconditionally makes the client's value irrelevant.
+// The header is written on EVERY request, "0" included. The map starts as a
+// copy of the client's own headers, so a value written only for large requests
+// would let any caller send their own count and route themselves. Overwriting
+// unconditionally makes the client's value irrelevant.
 //
 // The map is REPLACED, not mutated. It is shared with other hooks and read
 // concurrently, so an in-place write is a data race.
@@ -178,10 +169,7 @@ func (p *Plugin) PreRequestHook(ctx *schemas.BifrostContext, req *schemas.Bifros
 		return nil
 	}
 
-	value := "0"
-	if p.EstimateTokens(req) >= p.threshold.Load() {
-		value = "1"
-	}
+	value := strconv.FormatInt(p.EstimateTokens(req), 10)
 
 	existing, _ := ctx.Value(schemas.BifrostContextKeyRequestHeaders).(map[string]string)
 	headers := make(map[string]string, len(existing)+1)

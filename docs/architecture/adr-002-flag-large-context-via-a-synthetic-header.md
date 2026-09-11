@@ -9,9 +9,9 @@ tags:
 - routing
 - plugins
 ---
-# Flag large-context requests with a synthetic header, estimated by payload size
+# Publish the estimated context size as a header, measured from payload size
 
-How this plugin tells Bifrost's routing rules that a request is large, and why
+How this plugin tells Bifrost's routing rules how large a request is, and why
 the measurement is an estimate.
 
 ## Context
@@ -32,11 +32,18 @@ not among the reserved context keys, so writes from a hook are permitted.
 
 ## Decision
 
-(a) **Mechanism**: a `PreRequestHook` measures the request and writes a header
-    into `BifrostContextKeyRequestHeaders`. The routing decision itself stays in
-    ordinary admin-UI rules matching `headers["x-ctx-large"] == "1"`. The plugin
-    answers "is this large", never "where should it go" — thresholds and targets
-    stay operator-editable without rebuilding anything.
+(a) **Mechanism**: a `PreRequestHook` measures the request and writes the count
+    into `BifrostContextKeyRequestHeaders` as a decimal string. Rules compare it
+    with `int(headers["x-ctx-tokens"]) > N`. The plugin answers "how large",
+    never "where should it go".
+
+    The count, not a boolean. A yes/no flag would bake one threshold into the
+    plugin: moving it means a config change, a second tier is impossible, and
+    every rule is stuck with the question the plugin already answered. Reporting
+    the number lets rules ask their own questions, as many as needed, with no
+    plugin change — and the plugin keeps no threshold at all. CEL's int()
+    conversion on a header was verified against the live gateway before
+    committing to this.
 
 (b) **Measurement**: `len(json.Marshal(messages)) / 4`, the conventional
     bytes-per-token approximation and the same fallback upstream's own draft
@@ -52,21 +59,22 @@ not among the reserved context keys, so writes from a hook are permitted.
     and estimate to zero.
 
 (d) **The header is written on every request**, `"0"` included. The map starts
-    as a copy of the client's own headers, so writing only when the request is
-    large would let any caller send the header themselves and choose their own
-    route. Unconditional overwrite makes the client's value irrelevant.
+    as a copy of the client's own headers, so writing only for large requests
+    would let any caller claim a size and choose their own route. Unconditional
+    overwrite makes the client's value irrelevant, and a rule comparing
+    `int(headers[...])` needs a value on every request regardless.
 
 (e) **The map is replaced, not mutated.** It is shared with other hooks and read
     concurrently; an in-place write is a data race.
 
 (f) **Config is read atomically.** `PUT /api/plugins/ctxlen` rewrites the config
-    of a live plugin, so the threshold and header name live in atomics rather
-    than plain fields.
+    of a live plugin, so the header name lives in an atomic rather than a plain
+    field.
 
 ## Consequences
 
-Operators tune the threshold and the routing target from the admin UI; only a
-change to the measurement itself needs a rebuild. The plugin must be registered
+Operators set thresholds and targets entirely in routing rules; only a change to
+the measurement itself needs a rebuild. The plugin must be registered
 with `placement: pre_builtin` — the default `post_builtin` runs after routing,
 where the header is useless, and nothing warns about that.
 

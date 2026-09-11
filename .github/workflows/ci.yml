@@ -46,21 +46,16 @@ jobs:
       - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
         with:
           go-version-file: go.mod
-      # install-mode: goinstall, not the default prebuilt binary.
-      #
       # golangci-lint refuses to analyse a module whose `go` directive is newer
-      # than the Go release its own binary was built with: the published v2.6.2
-      # is built with Go 1.25 and bails out on this module's `go 1.27.0` with
-      # "the Go language version used to build golangci-lint is lower than the
-      # targeted Go version". Building it from source with the toolchain
-      # setup-go just installed sidesteps that, at the cost of a slower job.
-      #
-      # Revert to the binary once upstream publishes a release built with Go
-      # 1.27 or newer.
-      - uses: golangci/golangci-lint-action@25e2cdc5eb1d7a04fdc45ff538f1a00e960ae128 # v8.0.0
+      # than the Go release its own binary was built with, and this module
+      # targets 1.27.0 because bifrost's modules do. v2.6.2 is built with Go
+      # 1.25 and bails out with "the Go language version used to build
+      # golangci-lint is lower than the targeted Go version"; v2.13.2 is built
+      # with 1.27.0 — verified with `go version` on the released binary — so the
+      # floor is met by using a current release rather than working around it.
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
-          version: v2.6.2
-          install-mode: goinstall
+          version: v2.13.2
 
   test:
     name: go test -race

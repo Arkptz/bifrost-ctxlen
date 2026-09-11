@@ -1,8 +1,8 @@
 # bifrost-ctxlen
 
-A [Bifrost](https://github.com/maximhq/bifrost) plugin that flags large-context
-requests, so routing rules in the admin UI can send them to a provider that
-handles them.
+A [Bifrost](https://github.com/maximhq/bifrost) plugin that reports each
+request's estimated context size, so routing rules in the admin UI can send the
+big ones somewhere that handles them.
 
 ```sh
 make verify        # build the .so and prove it loads
@@ -20,12 +20,19 @@ draft PR adding exactly that variable.
 
 What a plugin *can* do is write into the request-headers map that the routing
 plugin already reads to populate its `headers[...]` variable. So this plugin
-measures the request and records a verdict; the routing decision itself stays
-where it belongs, in ordinary rules you manage from the UI:
+measures the request and publishes the number; every threshold stays in ordinary
+rules you manage from the UI:
 
 ```text
-headers["x-ctx-large"] == "1"   ->  your long-context provider
+int(headers["x-ctx-tokens"]) > 500000   ->  your long-context provider
+int(headers["x-ctx-tokens"]) > 900000   ->  something bigger still
 ```
+
+It publishes the count rather than a yes/no flag on purpose. A boolean bakes one
+threshold into the plugin: changing it means editing config, a second tier is
+impossible, and every rule can only ask the question the plugin already decided.
+A number lets rules ask their own questions, as many as you like, with no plugin
+change. `int()` on a header was verified against a live gateway first.
 
 ## Setup
 
@@ -40,17 +47,17 @@ arrives too late to affect anything:
   "placement": "pre_builtin",
   "enabled": true,
   "config": {
-    "threshold_tokens": 500000,
-    "header": "x-ctx-large"
+    "header": "x-ctx-tokens"
   }
 }
 ```
 
-Both config fields are optional and default to the values above. They are
-editable at runtime through `PUT /api/plugins/ctxlen` and the admin UI — the
-plugin reads them atomically, so a change takes effect without a restart.
+`header` is optional and defaults to the value above. It is editable at runtime
+through `PUT /api/plugins/ctxlen` and the admin UI — the plugin reads it
+atomically, so a change takes effect without a restart. There is no threshold to
+configure: that lives in the rules.
 
-Then add a routing rule matching `headers["x-ctx-large"] == "1"`.
+Then add a routing rule comparing `int(headers["x-ctx-tokens"])`.
 
 ## How the measurement works
 
@@ -68,10 +75,11 @@ rest are not context-window bound, and estimate to zero.
 
 ## Two details that are easy to get wrong
 
-**The header is written on every request**, including `"0"` for small ones. The
-map starts as a copy of the *client's* headers, so a value set only when the
-request is large would let any caller send `x-ctx-large: 1` and pick its own
-route. Overwriting unconditionally makes the client's value irrelevant.
+**The header is written on every request**, `"0"` included. The map starts as a
+copy of the *client's* headers, so a value written only for large requests would
+let any caller claim their own size and pick their own route. Overwriting
+unconditionally makes the client's value irrelevant — and a rule comparing
+`int(headers[...])` needs a value present on every request anyway.
 
 **The map is replaced, not mutated.** It is shared with other hooks and read
 concurrently, so writing into the existing map is a data race.

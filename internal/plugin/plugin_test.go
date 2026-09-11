@@ -1,6 +1,7 @@
 package plugin
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -22,15 +23,28 @@ func chatRequest(approxTokens int) *schemas.BifrostRequest {
 	}
 }
 
+// headerValue runs the hook and returns what it published.
+func headerValue(t *testing.T, p *Plugin, req *schemas.BifrostRequest, seed map[string]string) string {
+	t.Helper()
+
+	ctx := schemas.NewBifrostContext(t.Context(), time.Now())
+	if seed != nil {
+		ctx.SetValue(schemas.BifrostContextKeyRequestHeaders, seed)
+	}
+	if err := p.PreRequestHook(ctx, req); err != nil {
+		t.Fatalf("PreRequestHook() = %v, want nil", err)
+	}
+
+	headers, _ := ctx.Value(schemas.BifrostContextKeyRequestHeaders).(map[string]string)
+	return headers[p.Header()]
+}
+
 func TestInitDefaults(t *testing.T) {
 	t.Parallel()
 
 	p := New()
 	if err := p.Init(nil); err != nil {
 		t.Fatalf("Init(nil) = %v, want nil: a plugin row with no config must load", err)
-	}
-	if got := p.Threshold(); got != defaultThresholdTokens {
-		t.Errorf("Threshold() = %d, want %d", got, defaultThresholdTokens)
 	}
 	if got := p.Header(); got != defaultHeader {
 		t.Errorf("Header() = %q, want %q", got, defaultHeader)
@@ -41,20 +55,12 @@ func TestInitAppliesConfig(t *testing.T) {
 	t.Parallel()
 
 	p := New()
-	// Shaped like the raw map the .so loader passes through, numbers included:
-	// JSON decodes every number as float64.
-	err := p.Init(map[string]any{
-		"threshold_tokens": float64(1000),
-		"header":           "x-big",
-	})
-	if err != nil {
+	// Shaped like the raw map the .so loader passes through.
+	if err := p.Init(map[string]any{"header": "x-tokens"}); err != nil {
 		t.Fatalf("Init() = %v, want nil", err)
 	}
-	if got := p.Threshold(); got != 1000 {
-		t.Errorf("Threshold() = %d, want 1000", got)
-	}
-	if got := p.Header(); got != "x-big" {
-		t.Errorf("Header() = %q, want %q", got, "x-big")
+	if got := p.Header(); got != "x-tokens" {
+		t.Errorf("Header() = %q, want %q", got, "x-tokens")
 	}
 }
 
@@ -62,12 +68,9 @@ func TestInitRejectsMalformedConfig(t *testing.T) {
 	t.Parallel()
 
 	cases := map[string]any{
-		"not an object":        "threshold=1",
-		"threshold wrong type": map[string]any{"threshold_tokens": "lots"},
-		"threshold zero":       map[string]any{"threshold_tokens": float64(0)},
-		"threshold negative":   map[string]any{"threshold_tokens": float64(-1)},
-		"header wrong type":    map[string]any{"header": 42},
-		"header empty":         map[string]any{"header": ""},
+		"not an object":     "header=x-tokens",
+		"header wrong type": map[string]any{"header": 42},
+		"header empty":      map[string]any{"header": ""},
 	}
 
 	for name, config := range cases {
@@ -88,8 +91,7 @@ func TestEstimateTokensIgnoresNonContextRequests(t *testing.T) {
 		t.Errorf("EstimateTokens(nil) = %d, want 0", got)
 	}
 	// An embedding request is not context-window bound.
-	empty := &schemas.BifrostRequest{}
-	if got := p.EstimateTokens(empty); got != 0 {
+	if got := p.EstimateTokens(&schemas.BifrostRequest{}); got != 0 {
 		t.Errorf("EstimateTokens(no payload) = %d, want 0", got)
 	}
 }
@@ -110,22 +112,34 @@ func TestEstimateTokensScalesWithPayload(t *testing.T) {
 	}
 }
 
-func TestPreRequestHookFlagsLargeRequests(t *testing.T) {
+func TestPreRequestHookPublishesTheCount(t *testing.T) {
 	t.Parallel()
 
+	// The header carries the number itself, so a rule can pick its own
+	// threshold with int(headers[...]) rather than trusting one baked in here.
 	p := New()
-	if err := p.Init(map[string]any{"threshold_tokens": float64(1000)}); err != nil {
-		t.Fatalf("Init() = %v", err)
-	}
+	req := chatRequest(10_000)
 
-	ctx := schemas.NewBifrostContext(t.Context(), time.Now())
-	if err := p.PreRequestHook(ctx, chatRequest(5000)); err != nil {
-		t.Fatalf("PreRequestHook() = %v, want nil", err)
+	got := headerValue(t, p, req, nil)
+	parsed, err := strconv.ParseInt(got, 10, 64)
+	if err != nil {
+		t.Fatalf("header %q is not an integer: %v", got, err)
 	}
+	if parsed != p.EstimateTokens(req) {
+		t.Errorf("header = %d, want %d (the estimate)", parsed, p.EstimateTokens(req))
+	}
+	if parsed < 5_000 || parsed > 20_000 {
+		t.Errorf("header = %d, want roughly 10k", parsed)
+	}
+}
 
-	headers, _ := ctx.Value(schemas.BifrostContextKeyRequestHeaders).(map[string]string)
-	if got := headers[defaultHeader]; got != "1" {
-		t.Errorf("%s = %q, want \"1\" for an over-threshold request", defaultHeader, got)
+func TestPreRequestHookReportsZeroForSmallRequests(t *testing.T) {
+	t.Parallel()
+
+	// Not "absent": a rule comparing int(headers[...]) needs a value on every
+	// request, and a missing header would make int() fail rather than compare.
+	if got := headerValue(t, New(), &schemas.BifrostRequest{}, nil); got != "0" {
+		t.Errorf("header = %q, want \"0\" for a request with no payload", got)
 	}
 }
 
@@ -133,24 +147,31 @@ func TestPreRequestHookOverwritesClientSuppliedValue(t *testing.T) {
 	t.Parallel()
 
 	// The headers map starts as a copy of what the CLIENT sent. If the hook
-	// only set its header when absent, any caller could route itself by
-	// sending it. A small request must come out flagged "0" regardless.
+	// did not overwrite, a caller could claim any size and route itself.
+	p := New()
+	seed := map[string]string{
+		defaultHeader: "999999999",
+		"user-agent":  "spoofer/1.0",
+	}
+
+	if got := headerValue(t, p, chatRequest(10), seed); got == "999999999" {
+		t.Error("a client-supplied count survived the hook")
+	}
+}
+
+func TestPreRequestHookPreservesOtherHeaders(t *testing.T) {
+	t.Parallel()
+
 	p := New()
 	ctx := schemas.NewBifrostContext(t.Context(), time.Now())
-	ctx.SetValue(schemas.BifrostContextKeyRequestHeaders, map[string]string{
-		defaultHeader: "1",
-		"user-agent":  "spoofer/1.0",
-	})
+	ctx.SetValue(schemas.BifrostContextKeyRequestHeaders, map[string]string{"user-agent": "curl/8"})
 
 	if err := p.PreRequestHook(ctx, chatRequest(10)); err != nil {
 		t.Fatalf("PreRequestHook() = %v", err)
 	}
 
 	headers, _ := ctx.Value(schemas.BifrostContextKeyRequestHeaders).(map[string]string)
-	if got := headers[defaultHeader]; got != "0" {
-		t.Errorf("%s = %q, want \"0\": a client-supplied value must not survive", defaultHeader, got)
-	}
-	if got := headers["user-agent"]; got != "spoofer/1.0" {
+	if got := headers["user-agent"]; got != "curl/8" {
 		t.Errorf("user-agent = %q, want the original value preserved", got)
 	}
 }
