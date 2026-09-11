@@ -112,6 +112,147 @@ func TestEstimateTokensScalesWithPayload(t *testing.T) {
 	}
 }
 
+func TestEstimateTokensCountsToolDefinitions(t *testing.T) {
+	t.Parallel()
+
+	// An agent client resends its whole toolset every turn, so a big toolset
+	// with a one-line message is exactly the request that must not look small.
+	description := strings.Repeat("d", 400_000)
+	p := New()
+	req := chatRequest(1)
+	req.ChatRequest.Params = &schemas.ChatParameters{
+		Tools: []schemas.ChatTool{{
+			Type: schemas.ChatToolTypeFunction,
+			Function: &schemas.ChatToolFunction{
+				Name:        "search",
+				Description: &description,
+			},
+		}},
+	}
+
+	if got := p.EstimateTokens(req); got < 50_000 {
+		t.Errorf("EstimateTokens(400kB of tool definitions) = %d, want the tools to count", got)
+	}
+}
+
+// inlineImageRequest builds a chat request carrying one base64 data: URL of the
+// given decoded size, the shape a client uses to attach a screenshot.
+func inlineImageRequest(decodedBytes int) *schemas.BifrostRequest {
+	url := "data:image/png;base64," + strings.Repeat("A", decodedBytes*4/3)
+	return &schemas.BifrostRequest{
+		ChatRequest: &schemas.BifrostChatRequest{
+			Input: []schemas.ChatMessage{{
+				Role: schemas.ChatMessageRoleUser,
+				Content: &schemas.ChatMessageContent{ContentBlocks: []schemas.ChatContentBlock{{
+					Type:           schemas.ChatContentBlockTypeImage,
+					ImageURLStruct: &schemas.ChatInputImage{URL: url},
+				}}},
+			}},
+		},
+	}
+}
+
+func TestEstimateTokensPricesImagesByModalityNotBytes(t *testing.T) {
+	t.Parallel()
+
+	// A 1 MB screenshot is ~1.4 MB of base64 in the body. Priced by bytes it
+	// would score ~350k tokens and route a trivial request to a long-context
+	// provider; providers bill it at 85-1568 depending on pixel size.
+	p := New()
+	got := p.EstimateTokens(inlineImageRequest(1 << 20))
+
+	if got > 4*imageTokens {
+		t.Errorf("EstimateTokens(1MB inline image) = %d, want on the order of %d", got, imageTokens)
+	}
+	if got < imageTokens {
+		t.Errorf("EstimateTokens(1MB inline image) = %d, want at least the per-image cost %d", got, imageTokens)
+	}
+}
+
+func TestEstimateTokensChargesRemoteImagesToo(t *testing.T) {
+	t.Parallel()
+
+	// The opposite error: an https:// URL is ~80 bytes in the body but the
+	// provider downloads the picture and bills the same ~1k tokens.
+	p := New()
+	req := &schemas.BifrostRequest{
+		ChatRequest: &schemas.BifrostChatRequest{
+			Input: []schemas.ChatMessage{{
+				Role: schemas.ChatMessageRoleUser,
+				Content: &schemas.ChatMessageContent{ContentBlocks: []schemas.ChatContentBlock{{
+					Type:           schemas.ChatContentBlockTypeImage,
+					ImageURLStruct: &schemas.ChatInputImage{URL: "https://example.com/screenshot.png"},
+				}}},
+			}},
+		},
+	}
+
+	if got := p.EstimateTokens(req); got < imageTokens {
+		t.Errorf("EstimateTokens(remote image) = %d, want at least %d", got, imageTokens)
+	}
+}
+
+func TestEstimateTokensCountsAudioAndFiles(t *testing.T) {
+	t.Parallel()
+
+	p := New()
+	fileData := strings.Repeat("B", 1<<20)
+	audio := strings.Repeat("C", 1<<20)
+
+	audioReq := &schemas.BifrostRequest{
+		ChatRequest: &schemas.BifrostChatRequest{
+			Input: []schemas.ChatMessage{{
+				Role: schemas.ChatMessageRoleUser,
+				Content: &schemas.ChatMessageContent{ContentBlocks: []schemas.ChatContentBlock{{
+					Type:       schemas.ChatContentBlockTypeInputAudio,
+					InputAudio: &schemas.ChatInputAudio{Data: audio},
+				}}},
+			}},
+		},
+	}
+	fileReq := &schemas.BifrostRequest{
+		ChatRequest: &schemas.BifrostChatRequest{
+			Input: []schemas.ChatMessage{{
+				Role: schemas.ChatMessageRoleUser,
+				Content: &schemas.ChatMessageContent{ContentBlocks: []schemas.ChatContentBlock{{
+					Type: schemas.ChatContentBlockTypeFile,
+					File: &schemas.ChatInputFile{FileData: &fileData},
+				}}},
+			}},
+		},
+	}
+
+	// Both must be far below the byte estimate (~262k) and far above zero:
+	// they consume context, just not one token per four base64 characters.
+	textEstimate := int64(1<<20) / bytesPerToken
+	for name, req := range map[string]*schemas.BifrostRequest{"audio": audioReq, "file": fileReq} {
+		got := p.EstimateTokens(req)
+		if got >= textEstimate {
+			t.Errorf("EstimateTokens(1MB %s) = %d, want well below the byte estimate %d", name, got, textEstimate)
+		}
+		if got == 0 {
+			t.Errorf("EstimateTokens(1MB %s) = 0, want a non-zero cost", name)
+		}
+	}
+}
+
+func TestEstimateTokensStillCountsTextAroundMedia(t *testing.T) {
+	t.Parallel()
+
+	// Subtracting the media bytes must not swallow the text next to them.
+	p := New()
+	text := strings.Repeat("x", 400_000)
+	req := inlineImageRequest(1 << 20)
+	req.ChatRequest.Input = append(req.ChatRequest.Input, schemas.ChatMessage{
+		Role:    schemas.ChatMessageRoleUser,
+		Content: &schemas.ChatMessageContent{ContentStr: &text},
+	})
+
+	if got := p.EstimateTokens(req); got < 50_000 {
+		t.Errorf("EstimateTokens(image + 400kB text) = %d, want the text to dominate", got)
+	}
+}
+
 func TestPreRequestHookPublishesTheCount(t *testing.T) {
 	t.Parallel()
 

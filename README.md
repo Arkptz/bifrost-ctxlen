@@ -61,14 +61,41 @@ Then add a routing rule comparing `int(headers["x-ctx-tokens"])`.
 
 ## How the measurement works
 
-The estimate is `len(json.Marshal(messages)) / 4` — the usual bytes-per-token
-rule of thumb, and the same fallback upstream's own draft uses.
+Text is measured as `bytes / 4` — the usual bytes-per-token rule of thumb, and
+the same fallback upstream's own draft uses. What is measured is the whole
+prompt: messages, tool definitions and system instructions. Tools matter as much
+as messages, because an agent client resends its entire toolset every turn.
+
+**Non-text parts are priced by modality, not by bytes.** No provider bills an
+image by the characters that carried it: OpenAI charges 85 tokens at
+`detail: low` and 765 for a 1024×1024 at `detail: high`, Anthropic
+`⌈w/28⌉·⌈h/28⌉` capped at 1568, Gemini 258 per tile or a flat 1120 on Gemini 3.
+Counting bytes is wrong in both directions, and by two orders of magnitude each
+way. The plugin therefore subtracts the media bytes from the text estimate and
+adds a per-modality cost instead:
+
+| Part | Charged |
+|------|---------|
+| Image, inline or by URL | 1600 tokens — the top of the documented range, so images err high |
+| Audio | decoded bytes / 500 (~16 kB/s at Gemini's 32 tokens/s) |
+| Inline document | decoded bytes / 20 (~1500–3000 tokens per PDF page) |
+| Document by URL or file id | 2000 tokens — one page; its real size is not in the request |
+
+Measured on this build, old versus new:
+
+| Request | Byte estimate | Modality estimate |
+|---------|--------------:|------------------:|
+| 1 MB inline screenshot | 349,549 | 1,618 |
+| Same image by `https://` URL | 24 | 1,618 |
+| 400 kB of tool definitions | 8 | 100,024 |
+| 2 MB of text | 524,295 | 524,296 |
 
 A real tokenizer would be more accurate and considerably worse in practice: it
 means a heavyweight dependency with per-model vocabularies, and any library also
 linked by the host widens the shared-package surface that Go's plugin runtime
 version-checks. For a coarse "is this request enormous" question an estimate
-that is never wrong by more than about a factor of two is enough.
+that is never wrong by more than about a factor of two is enough — and for media
+it is the *modality*, not the tokenizer, that supplies that factor.
 
 Only chat and responses payloads are measured. Embeddings, transcription and the
 rest are not context-window bound, and estimate to zero.

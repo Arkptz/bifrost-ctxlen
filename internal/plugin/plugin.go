@@ -46,9 +46,10 @@ const (
 	// specific: a generic one risks colliding with something a client sends.
 	defaultHeader = "x-ctx-tokens"
 
-	// bytesPerToken converts serialized request size to an approximate token
+	// bytesPerToken converts serialized TEXT size to an approximate token
 	// count. Four is the usual rule of thumb for English text and the same
-	// estimate upstream's own draft implementation falls back to.
+	// estimate upstream's own draft implementation falls back to
+	// (core/providers/bedrock/count_tokens.go uses the same constant).
 	//
 	// A real tokenizer would be more accurate and much worse here: it would
 	// mean a heavyweight dependency, per-model vocabularies, and — the part
@@ -57,6 +58,46 @@ const (
 	// coarse "is this request enormous" question, an estimate that is never
 	// wrong by more than a factor of two is enough.
 	bytesPerToken = 4
+
+	// imageTokens is what one image part is charged, whatever its bytes.
+	//
+	// Providers bill the DECODED image by its pixel dimensions, never by the
+	// characters that carried it: OpenAI charges 85 tokens at detail=low and
+	// 765 for a 1024x1024 at detail=high (max 1445 for the tile family),
+	// Anthropic ceil(w/28)*ceil(h/28) capped at 1568 on the standard tier,
+	// Gemini 258 per 768px tile or a flat 1120 on Gemini 3. Sizing the request
+	// by bytes therefore mis-measures images in BOTH directions: a 1 MB inline
+	// image is ~1.4 MB of base64 and would score ~350k tokens instead of ~1k,
+	// while an 80-character https:// URL would score ~20 for the same picture.
+	// The first inflation is what makes a byte-counting estimate dangerous —
+	// one screenshot routes a small request to a long-context provider.
+	//
+	// 1600 is the top of the documented range, so the estimate errs high on
+	// images rather than letting a genuinely long request look small.
+	imageTokens = 1600
+
+	// audioBytesPerToken converts DECODED audio bytes to tokens. Providers
+	// bill audio per second (OpenAI Realtime 10 tokens/s, Gemini 32/s); the
+	// request carries no duration, so this assumes ~16 kB/s (128 kbps, typical
+	// mp3) and charges the higher of the two rates: 16000/32 = 500 bytes per
+	// token.
+	audioBytesPerToken = 500
+
+	// fileBytesPerToken converts DECODED document bytes to tokens. Anthropic
+	// documents 1500-3000 text tokens per PDF page and ~50 kB is an ordinary
+	// page, which lands near 20 bytes per token.
+	fileBytesPerToken = 20
+
+	// remoteFileTokens is charged for a document referenced by URL or file id.
+	// Its size is not in the request at all, so this is one page's worth
+	// (Anthropic's documented per-page range) and a deliberate UNDERestimate
+	// for a large remote document — nothing in the request could tell us more.
+	remoteFileTokens = 2000
+
+	// base64Numerator/base64Denominator recover the decoded size of a base64
+	// payload without decoding it: 4 encoded characters carry 3 bytes.
+	base64Numerator   = 3
+	base64Denominator = 4
 )
 
 // Plugin measures requests and publishes the estimate.
@@ -119,21 +160,39 @@ func (p *Plugin) Header() string {
 
 // EstimateTokens approximates the token count of a request.
 //
-// Only the message payload is measured: it dominates the size of any request
-// big enough to matter, and it is the part that actually consumes the context
-// window. Requests carrying no messages estimate to zero, which is correct —
-// they cannot be large-context.
+// What is measured is the prompt: the messages, the tool definitions and the
+// system instructions, which are what actually occupies the context window. A
+// request carrying none of them estimates to zero, which is correct — it cannot
+// be large-context.
+//
+// Text is measured by its serialized size, but non-text parts are NOT: no
+// provider bills an image, an audio clip or a PDF by the characters that
+// carried it. Those parts are subtracted from the byte count and priced by
+// modality instead — see mediaCost.
 func (p *Plugin) EstimateTokens(req *schemas.BifrostRequest) int64 {
 	if req == nil {
 		return 0
 	}
 
-	var payload any
+	// Tool definitions and the system instructions are part of the prompt and
+	// are frequently the LARGER half of it: an agent client sends its whole
+	// toolset on every turn, so measuring only the messages under-reports the
+	// requests this plugin exists to catch.
+	var payload []any
+	var media mediaCost
 	switch {
 	case req.ChatRequest != nil:
-		payload = req.ChatRequest.Input
+		payload = append(payload, req.ChatRequest.Input)
+		if params := req.ChatRequest.Params; params != nil {
+			payload = append(payload, params.Tools)
+		}
+		media = chatMediaCost(req.ChatRequest.Input)
 	case req.ResponsesRequest != nil:
-		payload = req.ResponsesRequest.Input
+		payload = append(payload, req.ResponsesRequest.Input)
+		if params := req.ResponsesRequest.Params; params != nil {
+			payload = append(payload, params.Tools, params.Instructions)
+		}
+		media = responsesMediaCost(req.ResponsesRequest.Input)
 	default:
 		// Embeddings, transcription, image generation and the rest are not
 		// context-window bound in the way this plugin cares about.
@@ -148,7 +207,110 @@ func (p *Plugin) EstimateTokens(req *schemas.BifrostRequest) int64 {
 		return 0
 	}
 
-	return int64(len(encoded)) / bytesPerToken
+	// Clamped at zero: only reachable if JSON escaping made the encoded form
+	// shorter than the raw strings it contains, which it cannot — but a
+	// negative would subtract from the media estimate rather than fail loudly.
+	textBytes := max(int64(len(encoded))-media.bytes, 0)
+
+	return textBytes/bytesPerToken + media.tokens
+}
+
+// mediaCost is what the non-text parts of a payload contribute: the serialized
+// bytes they occupy (to be removed from the text estimate) and the tokens a
+// provider will actually bill for them.
+type mediaCost struct {
+	bytes  int64
+	tokens int64
+}
+
+func (m *mediaCost) addInline(payload string, bytesPerToken int64) {
+	m.bytes += int64(len(payload))
+	m.tokens += decodedSize(payload) / bytesPerToken
+}
+
+func (m *mediaCost) addImage(reference string) {
+	m.bytes += int64(len(reference))
+	m.tokens += imageTokens
+}
+
+func (m *mediaCost) addRemoteFile(reference string) {
+	m.bytes += int64(len(reference))
+	m.tokens += remoteFileTokens
+}
+
+// decodedSize is the byte length a base64 payload decodes to. A payload that is
+// not base64 at all (a plain-text file block, a data: URL prefix) is measured as
+// itself plus a quarter, which is close enough for a size estimate.
+func decodedSize(payload string) int64 {
+	return int64(len(payload)) * base64Numerator / base64Denominator
+}
+
+func chatMediaCost(messages []schemas.ChatMessage) mediaCost {
+	var cost mediaCost
+
+	for _, message := range messages {
+		if message.ChatAssistantMessage != nil && message.Audio != nil {
+			// Audio the model produced, replayed as history: it occupies the
+			// context window exactly like audio the client sent.
+			cost.addInline(message.Audio.Data, audioBytesPerToken)
+		}
+
+		if message.Content == nil {
+			continue
+		}
+		for _, block := range message.Content.ContentBlocks {
+			switch {
+			case block.ImageURLStruct != nil:
+				cost.addImage(block.ImageURLStruct.URL)
+			case block.InputAudio != nil:
+				cost.addInline(block.InputAudio.Data, audioBytesPerToken)
+			case block.File != nil:
+				switch {
+				case block.File.FileData != nil:
+					cost.addInline(*block.File.FileData, fileBytesPerToken)
+				case block.File.FileURL != nil:
+					cost.addRemoteFile(*block.File.FileURL)
+				case block.File.FileID != nil:
+					cost.addRemoteFile(*block.File.FileID)
+				}
+			}
+		}
+	}
+
+	return cost
+}
+
+func responsesMediaCost(messages []schemas.ResponsesMessage) mediaCost {
+	var cost mediaCost
+
+	for _, message := range messages {
+		if message.Content == nil {
+			continue
+		}
+		for _, block := range message.Content.ContentBlocks {
+			switch {
+			case block.ResponsesInputMessageContentBlockImage != nil:
+				if block.ImageURL != nil {
+					cost.addImage(*block.ImageURL)
+				} else {
+					cost.addImage("")
+				}
+			case block.Audio != nil:
+				cost.addInline(block.Audio.Data, audioBytesPerToken)
+			case block.ResponsesInputMessageContentBlockFile != nil:
+				switch {
+				case block.FileData != nil:
+					cost.addInline(*block.FileData, fileBytesPerToken)
+				case block.FileURL != nil:
+					cost.addRemoteFile(*block.FileURL)
+				case block.FileID != nil:
+					cost.addRemoteFile(*block.FileID)
+				}
+			}
+		}
+	}
+
+	return cost
 }
 
 // PreRequestHook measures the request and publishes the estimate as a header.
