@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/SECURITY/advisories
+    about: Do not file public issues for security bugs — report privately. See SECURITY.md.

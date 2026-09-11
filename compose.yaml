@@ -1,0 +1,49 @@
+# Integration stand: build the plugin, drop it into a shared volume, and start a
+# bifrost that loads it.
+#
+# This exists because a passing `go test` does not answer the only question that
+# matters before deploying — does this .so actually load into a real gateway.
+# Run it and watch the bifrost logs: a version mismatch shows up as
+# "plugin was built with a different version of package ...".
+#
+#   docker compose up --build
+#
+# BIFROST_IMAGE must be an image built from the SAME core version as go.mod
+# (and a non-static one — a statically linked Go binary cannot dlopen at all).
+# The default tag is a starting point, not a guarantee; check with
+# `go version -m` inside the image before trusting a green run.
+
+services:
+  plugin-build:
+    build:
+      context: .
+      args:
+        GO_VERSION: ${GO_VERSION:-1.27.0}
+        PLUGIN: ${PLUGIN:-bifrost-ctxlen}
+    volumes:
+      - plugins:/shared
+    # One-shot: copies the .so out and exits.
+    restart: "no"
+
+  bifrost:
+    image: ${BIFROST_IMAGE:-maximhq/bifrost:latest}
+    depends_on:
+      plugin-build:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - plugins:/app/plugins:ro
+      - ./compose/bifrost:/app/config:ro
+    environment:
+      # The plugin must run BEFORE the built-in governance and routing plugins
+      # if it means to influence them; the default placement is post_builtin,
+      # which is too late. Configure that in the plugin row, e.g.
+      #   {"name": "hello-world",
+      #    "path": "/app/plugins/bifrost-ctxlen.so",
+      #    "placement": "pre_builtin",
+      #    "enabled": true}
+      APP_PORT: "8080"
+
+volumes:
+  plugins:

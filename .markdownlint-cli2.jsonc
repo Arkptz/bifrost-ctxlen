@@ -1,0 +1,14 @@
+{
+  // Shared markdownlint-cli2 configuration for every template.
+  // Spelling is handled by the `typos` CI job — not duplicated here.
+  "config": {
+    "MD013": false, // line-length: prose, tables and badge rows exceed 80 cols
+    "MD033": false, // inline HTML: centered badge blocks and cargo-rdme markers
+    "MD041": false, // first-line-heading: files may open with badges, not a title
+    "MD025": false, // single-H1: AGENTS.md intentionally pairs conventions + Decision Graph
+    "MD032": false, // blanks-around-lists: matches the generated dg-section list style
+    "MD060": false  // table-pipe-style: cosmetic pipe spacing, not worth churning tables
+  },
+  "globs": ["**/*.md"],
+  "ignores": ["**/docs/**", "**/.dg/**", "**/CHANGELOG.md"]
+}

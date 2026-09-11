@@ -1,0 +1,29 @@
+#!/usr/bin/env sh
+# Conventional Commits check. Zero-dependency POSIX sh. Mirrors the type list in
+# CONTRIBUTING.md and the commit-lint CI workflow.
+set -eu
+
+msg_file="$1"
+first_line=$(head -n1 "$msg_file")
+
+# Skip auto-generated commits (merge/revert/fixup/squash).
+case "$first_line" in
+    "Merge "* | "Revert "* | "fixup!"* | "squash!"*) exit 0 ;;
+esac
+
+pattern='^(feat|fix|refactor|perf|test|docs|chore|ci|build|revert)(\([a-z0-9._/, -]+\))?(!)?: *[^ ].*'
+if ! printf '%s' "$first_line" | grep -Eq "$pattern"; then
+    echo "commit-msg: subject must follow Conventional Commits:" >&2
+    echo "  <type>[optional scope][!]: <description>" >&2
+    echo "  types: feat fix refactor perf test docs chore ci build revert" >&2
+    echo "  got: $first_line" >&2
+    exit 1
+fi
+
+# Description should start lowercase (matches the CI subjectPattern).
+case "$first_line" in
+    *": "[A-Z]*)
+        echo "commit-msg: description should start lowercase: $first_line" >&2
+        exit 1
+        ;;
+esac

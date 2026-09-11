@@ -1,0 +1,7 @@
+ignore_merge_commits = true
+
+[commit_types]
+chore = { omit_from_changelog = true }
+test = { omit_from_changelog = true }
+ci = { omit_from_changelog = true }
+build = { omit_from_changelog = true }

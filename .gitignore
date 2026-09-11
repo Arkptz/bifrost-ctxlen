@@ -1,0 +1,14 @@
+# Binaries
+/bin/
+*.exe
+
+# Go build cache
+/tmp/
+
+# Editor
+.idea/
+.vscode/
+*.swp
+
+# Test output
+coverage.out

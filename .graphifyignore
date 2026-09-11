@@ -1,0 +1,28 @@
+# graphify scan-exclusion list (gitignore semantics, scan-root relative).
+# Merged with .gitignore by graphify. Keeps secrets + vendor/build noise out of
+# the knowledge-graph corpus — and, for the LLM path, out of what is sent to the
+# backend (graphify reads file CONTENT before any commit). The real control is
+# WHICH directory you scan: never point graphify at secret material.
+
+# Secrets / credentials
+*.env
+.env.*
+!.env.example
+**/secrets/**
+*.pem
+*.key
+*_rsa
+*_ed25519
+
+# graphify's own output (never treat the graph as input)
+graphify-out/
+
+# Vendor / build noise
+node_modules/
+.venv/
+.direnv/
+target/
+dist/
+build/
+result
+result-*

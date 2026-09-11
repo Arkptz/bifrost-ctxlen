@@ -1,0 +1,46 @@
+{
+  $schema: "https://docs.renovatebot.com/renovate-schema.json",
+  extends: [
+    "config:recommended",
+    "helpers:pinGitHubActionDigests",
+    ":semanticCommits",
+  ],
+  pinDigests: true,
+  timezone: "Etc/UTC",
+  schedule: ["before 6am on monday"],
+
+  // Deliberately DISABLED, unlike every other template here.
+  //
+  // A Go plugin must be compiled against the exact same package versions as
+  // the binary that dlopens it — the runtime compares a hash of the whole
+  // shared transitive closure. Lockfile maintenance exists to nudge indirect
+  // dependencies, which is precisely the change that produces a plugin failing
+  // at plugin.Open with "plugin was built with a different version of package".
+  lockFileMaintenance: {
+    enabled: false,
+  },
+
+  packageRules: [
+    {
+      matchManagers: ["github-actions"],
+      groupName: "github-actions",
+    },
+    {
+      matchManagers: ["github-actions"],
+      matchUpdateTypes: ["patch", "pin", "digest"],
+      groupName: "github-actions",
+    },
+    {
+      // Every Go dependency here is part of an ABI contract with the host, not
+      // an ordinary dependency: patch-level drift in something this module
+      // never imports directly is still enough to make the .so unloadable.
+      // Renovate still opens the PRs — seeing that upstream moved is useful —
+      // but they wait for approval on the dependency dashboard so the bump
+      // happens together with rebuilding and redeploying the host.
+      matchManagers: ["gomod"],
+      dependencyDashboardApproval: true,
+      groupName: "bifrost abi set",
+      commitMessageTopic: "bifrost ABI set (rebuild the host alongside)",
+    },
+  ],
+}
