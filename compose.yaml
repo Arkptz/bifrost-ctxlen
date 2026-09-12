@@ -26,7 +26,7 @@ services:
     restart: "no"
 
   bifrost:
-    image: ${BIFROST_IMAGE:-maximhq/bifrost:latest}
+    image: ${BIFROST_IMAGE:-maximhq/bifrost:latest@sha256:9e65eb4d0b292c25aaf46d194c705344f19c833a29e30155038bbe551eac7245}
     depends_on:
       plugin-build:
         condition: service_completed_successfully
