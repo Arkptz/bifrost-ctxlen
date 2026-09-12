@@ -82,12 +82,44 @@ an `est=` — that case estimates to zero, which would make a large request look
 small.
 
 **As headers**, every field above under `x-ctxlen-`, so a rule can compare any
-of them and not just the total:
+of them and not just the total.
+
+| Header | Meaning |
+|---|---|
+| `x-ctx-tokens` | **The total estimate.** This is the one routing rules normally compare. |
+| `x-ctxlen-kind` | Request family: `chat`, `responses` or `other`. The only non-numeric field. |
+| `x-ctxlen-msgs` | Number of messages in the prompt. |
+| `x-ctxlen-tools` | Number of tool definitions sent with the request. |
+| `x-ctxlen-sys` | 1 when system instructions are present, else 0 (Responses API only). |
+| `x-ctxlen-ascii` | ASCII bytes of the serialized prompt, media already excluded. |
+| `x-ctxlen-nonascii` | Non-ASCII bytes. High means non-Latin text — Cyrillic, CJK. |
+| `x-ctxlen-mediab` | Bytes that were excluded as media and priced by modality instead. |
+| `x-ctxlen-text` | Tokens attributed to text. |
+| `x-ctxlen-frame` | Tokens attributed to per-message framing (`msgs` × 3). |
+| `x-ctxlen-media` | Tokens attributed to images, audio and documents. |
+| `x-ctxlen-img` | Number of images, inline or by URL. |
+| `x-ctxlen-audio` | Number of audio clips. |
+| `x-ctxlen-doc` | Number of inline documents. |
+| `x-ctxlen-docurl` | Number of documents referenced by URL or file id. |
+| `x-ctxlen-bodyascii` | ASCII bytes of the RAW body, media excluded (shadow). |
+| `x-ctxlen-bodynonascii` | Non-ASCII bytes of the raw body (shadow). |
+| `x-ctxlen-bodyest` | The estimate computed from the raw body (shadow). |
+
+`x-ctx-tokens` satisfies `text + frame + media`. Every value is a decimal
+integer except `kind`, so a rule converts with `int()`.
+
+Rules can therefore ask more than "how big":
 
 ```text
-int(headers["x-ctxlen-nonascii"]) > 0      ->  the prompt is not plain English
+int(headers["x-ctx-tokens"]) > 500000      ->  a long-context provider
+int(headers["x-ctxlen-nonascii"]) > 100000 ->  the prompt is largely non-Latin
 int(headers["x-ctxlen-img"]) > 4           ->  an image-heavy request
+int(headers["x-ctxlen-tools"]) > 40        ->  a tool-heavy agent client
+int(headers["x-ctxlen-media"]) > 20000     ->  media dominates the context
 ```
+
+A header is written on EVERY request, so a rule never fails on a missing key —
+CEL treats an absent key as a non-match, which silently disables the rule.
 
 Every published value is an integer, except `kind`, which comes from a closed
 set (`chat`, `responses`, `other`). That is mechanical, not a convention: no
@@ -143,8 +175,10 @@ overhead is a stable fraction the constants already absorb.
 Both counts are published: `x-ctx-tokens` (and the `x-ctxlen-*` breakdown) is the
 authoritative marshal-derived number, while `x-ctxlen-bodyest` /
 `x-ctxlen-bodyascii` / `x-ctxlen-bodynonascii` carry the body measurement in
-shadow. Publishing both is what lets the body path be verified against billed
-tokens on live traffic before it becomes authoritative.
+shadow. The body path subtracts inline media the same way the marshal path does,
+so an inline image is priced by modality in both. Publishing both is what lets
+the body path be verified against billed tokens on live traffic before it
+becomes authoritative.
 
 ## How the measurement works
 
