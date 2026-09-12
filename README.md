@@ -61,10 +61,29 @@ Then add a routing rule comparing `int(headers["x-ctx-tokens"])`.
 
 ## How the measurement works
 
-Text is measured as `bytes / 4` — the usual bytes-per-token rule of thumb, and
-the same fallback upstream's own draft uses. What is measured is the whole
-prompt: messages, tool definitions and system instructions. Tools matter as much
-as messages, because an agent client resends its entire toolset every turn.
+Text is priced per byte class, and the whole prompt is measured: messages, tool
+definitions and system instructions. Tools matter as much as messages, because
+an agent client resends its entire toolset every turn.
+
+The familiar "4 per token" is **4 characters of English prose**, and applying it
+to `len(json.Marshal(...))` — which is **bytes** — conflates the two units. Go
+writes non-ASCII into JSON as raw UTF-8, so one Cyrillic character arrives as
+two bytes and gets charged double. Prose is also the wrong corpus: code, JSON
+and tool schemas tokenize denser. Both errors point the same way, and against
+what providers actually billed for 12 real requests the flat divisor came out
+**30-39% low** — the dangerous direction, because a request that looks small
+gets routed to a short-context provider and fails mid-session.
+
+| Byte class | Bytes per token |
+|---|---|
+| ASCII | 2.55 |
+| non-ASCII | 3.85 |
+| per message | +3 tokens of framing |
+
+3.85 bytes per non-ASCII token is 1.93 *characters* per token for two-byte
+Cyrillic, which independently matches the 1.5-2 chars/token that o200k is
+documented to reach on Russian. Worst-case error over the corpus is **3.7%**,
+against 39% before.
 
 **Non-text parts are priced by modality, not by bytes.** No provider bills an
 image by the characters that carried it: OpenAI charges 85 tokens at
@@ -81,14 +100,13 @@ adds a per-modality cost instead:
 | Inline document | decoded bytes / 20 (~1500–3000 tokens per PDF page) |
 | Document by URL or file id | 2000 tokens — one page; its real size is not in the request |
 
-Measured on this build, old versus new:
+Measured on this build, a flat byte count versus what ships:
 
-| Request | Byte estimate | Modality estimate |
-|---------|--------------:|------------------:|
-| 1 MB inline screenshot | 349,549 | 1,618 |
-| Same image by `https://` URL | 24 | 1,618 |
-| 400 kB of tool definitions | 8 | 100,024 |
-| 2 MB of text | 524,295 | 524,296 |
+| Request | Flat bytes/4 | This estimator |
+|---------|-------------:|---------------:|
+| 1 MB inline screenshot | 349,549 | ~1,600 |
+| Same image by `https://` URL | 24 | ~1,600 |
+| 400 kB of tool definitions | 8 | ~157,000 |
 
 A real tokenizer would be more accurate and considerably worse in practice: it
 means a heavyweight dependency with per-model vocabularies, and any library also

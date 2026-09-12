@@ -46,18 +46,37 @@ const (
 	// specific: a generic one risks colliding with something a client sends.
 	defaultHeader = "x-ctx-tokens"
 
-	// bytesPerToken converts serialized TEXT size to an approximate token
-	// count. Four is the usual rule of thumb for English text and the same
-	// estimate upstream's own draft implementation falls back to
-	// (core/providers/bedrock/count_tokens.go uses the same constant).
+	// Text is priced per BYTE CLASS, not by one flat divisor.
+	//
+	// The familiar "4 per token" is 4 CHARACTERS of English prose (OpenAI's
+	// help centre and Gemini's docs both say characters, and both warn that
+	// "other languages can have different relationships between characters,
+	// words, and tokens"). Applying it to len(json.Marshal(...)) — which is
+	// BYTES — mixes up the two units, and Go writes non-ASCII into JSON as raw
+	// UTF-8, so one Cyrillic character arrives as two bytes. Prose is also the
+	// wrong corpus: this traffic is code, JSON and tool schemas, which tokenize
+	// denser than prose. Both errors point the same way, and measured against
+	// what providers actually billed for 12 real requests the old divisor came
+	// out 30-39% LOW — the dangerous direction, since a request that looks
+	// small gets routed to a short-context provider and fails mid-session.
+	//
+	// The two constants below are fitted to those 12 requests (see
+	// TestCalibrateAgainstRealTraffic). They are not arbitrary: 3.85 bytes per
+	// non-ASCII token is 1.93 CHARACTERS per token for two-byte Cyrillic, which
+	// independently matches the 1.5-2 chars/token that o200k is documented to
+	// achieve on Russian. Worst case over the corpus is 3.7%, against 39%.
 	//
 	// A real tokenizer would be more accurate and much worse here: it would
 	// mean a heavyweight dependency, per-model vocabularies, and — the part
 	// that actually bites — any library also linked by the host widens the
-	// shared-package surface that Go's plugin runtime version-checks. For a
-	// coarse "is this request enormous" question, an estimate that is never
-	// wrong by more than a factor of two is enough.
-	bytesPerToken = 4
+	// shared-package surface that Go's plugin runtime version-checks.
+	asciiBytesPerToken    = 2.55
+	nonASCIIBytesPerToken = 3.85
+
+	// tokensPerMessage is the per-message framing every chat API adds around
+	// content (role markers and separators). OpenAI's cookbook counts 3 tokens
+	// per message for current models, and that is what this is.
+	tokensPerMessage = 3
 
 	// imageTokens is what one image part is charged, whatever its bytes.
 	//
@@ -184,6 +203,7 @@ func (p *Plugin) EstimateTokens(req *schemas.BifrostRequest) int64 {
 	// requests this plugin exists to catch.
 	var payload []any
 	var media mediaCost
+	var messages int
 	switch {
 	case req.ChatRequest != nil:
 		payload = append(payload, req.ChatRequest.Input)
@@ -191,12 +211,14 @@ func (p *Plugin) EstimateTokens(req *schemas.BifrostRequest) int64 {
 			payload = append(payload, params.Tools)
 		}
 		media = chatMediaCost(req.ChatRequest.Input)
+		messages = len(req.ChatRequest.Input)
 	case req.ResponsesRequest != nil:
 		payload = append(payload, req.ResponsesRequest.Input)
 		if params := req.ResponsesRequest.Params; params != nil {
 			payload = append(payload, params.Tools, params.Instructions)
 		}
 		media = responsesMediaCost(req.ResponsesRequest.Input)
+		messages = len(req.ResponsesRequest.Input)
 	default:
 		// Embeddings, transcription, image generation and the rest are not
 		// context-window bound in the way this plugin cares about.
@@ -211,12 +233,34 @@ func (p *Plugin) EstimateTokens(req *schemas.BifrostRequest) int64 {
 		return 0
 	}
 
-	// Clamped at zero: only reachable if JSON escaping made the encoded form
-	// shorter than the raw strings it contains, which it cannot — but a
-	// negative would subtract from the media estimate rather than fail loudly.
-	textBytes := max(int64(len(encoded))-media.bytes, 0)
+	ascii, nonASCII := countByteClasses(encoded)
 
-	return textBytes/bytesPerToken + media.tokens
+	// Media bytes are removed from the text estimate — they are priced by
+	// modality instead. They come off the ASCII side because base64 and URLs
+	// are ASCII; clamped at zero so a miscount can never make text negative.
+	ascii = max(ascii-media.bytes, 0)
+
+	text := float64(ascii)/asciiBytesPerToken + float64(nonASCII)/nonASCIIBytesPerToken
+
+	return int64(text) + int64(messages)*tokensPerMessage + media.tokens
+}
+
+// countByteClasses splits a UTF-8 buffer into ASCII and non-ASCII byte counts.
+//
+// The split is the whole point of the estimate: a byte below 0x80 is one
+// character, while a non-ASCII character arrives as two to four bytes, so a
+// single divisor systematically misprices whichever class it was not fitted to.
+// Counting bytes rather than decoding runes keeps this a single linear pass
+// with no allocation, which matters because it runs on every request.
+func countByteClasses(b []byte) (ascii, nonASCII int64) {
+	for _, c := range b {
+		if c < 0x80 {
+			ascii++
+		} else {
+			nonASCII++
+		}
+	}
+	return ascii, nonASCII
 }
 
 // mediaCost is what the non-text parts of a payload contribute: the serialized

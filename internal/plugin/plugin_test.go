@@ -9,10 +9,10 @@ import (
 	"github.com/maximhq/bifrost/core/schemas"
 )
 
-// chatRequest builds a chat request whose serialized payload is at least
-// approxTokens*bytesPerToken bytes, so tests can express sizes in tokens.
+// chatRequest builds a chat request of roughly approxTokens ASCII tokens, so
+// tests can express sizes in tokens rather than bytes.
 func chatRequest(approxTokens int) *schemas.BifrostRequest {
-	content := strings.Repeat("x", approxTokens*bytesPerToken)
+	content := strings.Repeat("x", int(float64(approxTokens)*asciiBytesPerToken))
 	return &schemas.BifrostRequest{
 		ChatRequest: &schemas.BifrostChatRequest{
 			Input: []schemas.ChatMessage{{
@@ -222,9 +222,11 @@ func TestEstimateTokensCountsAudioAndFiles(t *testing.T) {
 		},
 	}
 
-	// Both must be far below the byte estimate (~262k) and far above zero:
-	// they consume context, just not one token per four base64 characters.
-	textEstimate := int64(1<<20) / bytesPerToken
+	// Both must be far below what the same bytes would cost as text, and far
+	// above zero: they consume context, just not one token per few base64
+	// characters.
+	mediaBytes := int64(1 << 20)
+	textEstimate := int64(float64(mediaBytes) / asciiBytesPerToken)
 	for name, req := range map[string]*schemas.BifrostRequest{"audio": audioReq, "file": fileReq} {
 		got := p.EstimateTokens(req)
 		if got >= textEstimate {

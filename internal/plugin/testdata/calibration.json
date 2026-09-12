@@ -1,0 +1,122 @@
+[
+  {
+    "messages": 27,
+    "tools": 23,
+    "message_ascii_bytes": 187051,
+    "message_nonascii_bytes": 1635,
+    "tool_ascii_bytes": 29323,
+    "tool_nonascii_bytes": 36,
+    "billed_prompt_tokens": 83660,
+    "cached_tokens": 79373
+  },
+  {
+    "messages": 33,
+    "tools": 23,
+    "message_ascii_bytes": 188790,
+    "message_nonascii_bytes": 1077,
+    "tool_ascii_bytes": 29323,
+    "tool_nonascii_bytes": 36,
+    "billed_prompt_tokens": 84704,
+    "cached_tokens": 84293
+  },
+  {
+    "messages": 35,
+    "tools": 23,
+    "message_ascii_bytes": 190018,
+    "message_nonascii_bytes": 1077,
+    "tool_ascii_bytes": 29323,
+    "tool_nonascii_bytes": 36,
+    "billed_prompt_tokens": 85243,
+    "cached_tokens": 84702
+  },
+  {
+    "messages": 30,
+    "tools": 23,
+    "message_ascii_bytes": 192362,
+    "message_nonascii_bytes": 1635,
+    "tool_ascii_bytes": 29323,
+    "tool_nonascii_bytes": 36,
+    "billed_prompt_tokens": 85876,
+    "cached_tokens": 83658
+  },
+  {
+    "messages": 32,
+    "tools": 23,
+    "message_ascii_bytes": 193529,
+    "message_nonascii_bytes": 1635,
+    "tool_ascii_bytes": 29323,
+    "tool_nonascii_bytes": 36,
+    "billed_prompt_tokens": 86355,
+    "cached_tokens": 85874
+  },
+  {
+    "messages": 37,
+    "tools": 23,
+    "message_ascii_bytes": 193907,
+    "message_nonascii_bytes": 1077,
+    "tool_ascii_bytes": 29323,
+    "tool_nonascii_bytes": 36,
+    "billed_prompt_tokens": 86928,
+    "cached_tokens": 85241
+  },
+  {
+    "messages": 34,
+    "tools": 23,
+    "message_ascii_bytes": 196958,
+    "message_nonascii_bytes": 1635,
+    "tool_ascii_bytes": 29323,
+    "tool_nonascii_bytes": 36,
+    "billed_prompt_tokens": 87878,
+    "cached_tokens": 86353
+  },
+  {
+    "messages": 116,
+    "tools": 23,
+    "message_ascii_bytes": 268357,
+    "message_nonascii_bytes": 2266,
+    "tool_ascii_bytes": 29323,
+    "tool_nonascii_bytes": 36,
+    "billed_prompt_tokens": 122172,
+    "cached_tokens": 120240
+  },
+  {
+    "messages": 170,
+    "tools": 23,
+    "message_ascii_bytes": 375203,
+    "message_nonascii_bytes": 3925,
+    "tool_ascii_bytes": 29323,
+    "tool_nonascii_bytes": 36,
+    "billed_prompt_tokens": 154848,
+    "cached_tokens": 154281
+  },
+  {
+    "messages": 172,
+    "tools": 23,
+    "message_ascii_bytes": 376113,
+    "message_nonascii_bytes": 3925,
+    "tool_ascii_bytes": 29323,
+    "tool_nonascii_bytes": 36,
+    "billed_prompt_tokens": 155281,
+    "cached_tokens": 154846
+  },
+  {
+    "messages": 643,
+    "tools": 25,
+    "message_ascii_bytes": 1035637,
+    "message_nonascii_bytes": 375514,
+    "tool_ascii_bytes": 46491,
+    "tool_nonascii_bytes": 78,
+    "billed_prompt_tokens": 522066,
+    "cached_tokens": 0
+  },
+  {
+    "messages": 645,
+    "tools": 25,
+    "message_ascii_bytes": 1037649,
+    "message_nonascii_bytes": 375521,
+    "tool_ascii_bytes": 46491,
+    "tool_nonascii_bytes": 78,
+    "billed_prompt_tokens": 522831,
+    "cached_tokens": 522064
+  }
+]
