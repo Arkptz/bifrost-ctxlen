@@ -89,24 +89,16 @@ ordinary rules in the admin UI.
     `plugin.Open`.
 
 ## Consequences
+The build mode couples host and plugin; the mitigations are in the decision above, the costs below.
 
-Plugin and gateway become a single atomic deployment: upgrading one without the
-other produces a runtime failure, not a build failure. CI catches disagreement
-with the *published* core version; it cannot catch disagreement with a
-self-built, patched host, which needs a check built from the host's own tree.
+### Positive
+- The plugin keeps its own repository and own release cycle (a), and the escape hatch survives: the same package compiles into a patched host with a `require`, a `replace` and a registration line — wiring, not a rewrite (b).
+- The silent failure modes of a `.so` are turned into build failures: compile-time hook asserts (e) and the CI load harness (f) catch a misspelled hook or an ABI mismatch that loading would otherwise swallow.
 
-The `.so` path also carries operational obligations that a compiled-in plugin
-would not have. The gateway stores an absolute path, so under Nix the artefact
-needs a GC root or a stable install location. A plugin that fails to load can
-take the gateway down with it, including the admin UI that would otherwise
-disable it, so disabling it directly in the database is the documented recovery.
-
-If these costs outgrow the benefit — and the benefit is thin, since the ability
-to update a plugin without rebuilding the host does not survive exact version
-coupling — decision (b) makes switching a matter of adding a `require`, a
-`replace` and a registration line to the host build, without touching the
-plugin's code.
-
+### Negative
+- Plugin and gateway become a single atomic deployment: upgrading one without the other produces a runtime failure, not a build failure. CI catches disagreement with the *published* core version; it cannot catch disagreement with a self-built, patched host, which needs a check built from the host's own tree.
+- The `.so` path carries operational obligations that a compiled-in plugin would not have. The gateway stores an absolute path, so under Nix the artefact needs a GC root or a stable install location. A plugin that fails to load can take the gateway down with it, including the admin UI that would otherwise disable it, so disabling it directly in the database is the documented recovery.
+- The benefit is thin — the ability to update a plugin without rebuilding the host does not survive exact version coupling — so the compile-in path (b) may yet win, which is why it was kept open.
 ## Alternatives considered
 
 **Compile into a forked `bifrost-http`.** Eliminates the version coupling
