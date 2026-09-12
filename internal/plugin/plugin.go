@@ -591,7 +591,13 @@ func (p *Plugin) PreRequestHook(ctx *schemas.BifrostContext, req *schemas.Bifros
 	// both is what lets the constants be re-fitted from production traffic
 	// before the cheap path takes over.
 	if size, ok := bodyMeasurement(ctx); ok {
-		estimate.BodyASCIIBytes = size.ascii
+		// Subtract the media bytes the same way the marshal path does. The raw
+		// body carries inline base64 in full — a screenshot is over a megabyte
+		// of it — and that is ASCII, so without this the shadow estimate prices
+		// an image as ~350k tokens of text instead of the ~1.6k its modality
+		// costs. The media bytes were already found by walking the parsed
+		// structs; the body just has to have them removed too.
+		estimate.BodyASCIIBytes = max(size.ascii-estimate.MediaBytes, 0)
 		estimate.BodyNonASCIIBytes = size.nonASCII
 		if size.ascii == 0 && size.nonASCII == 0 && size.contentLength > 0 {
 			// Body not retained (over the large-payload threshold, or chunked).

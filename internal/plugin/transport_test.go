@@ -82,6 +82,46 @@ func TestTransportHookMeasuresTheBody(t *testing.T) {
 	}
 }
 
+// TestBodyEstimateSubtractsInlineMedia is the regression for a real defect: the
+// raw body carries inline base64 in full, and counting it as text priced a 1 MB
+// screenshot as ~350k tokens. The body estimate must subtract media the same way
+// the marshal estimate does.
+func TestBodyEstimateSubtractsInlineMedia(t *testing.T) {
+	t.Parallel()
+
+	// One image as a ~1 MB base64 data URL, plus a short text message.
+	dataURL := "data:image/png;base64," + strings.Repeat("A", (1<<20)*4/3)
+	req := &schemas.BifrostRequest{ChatRequest: &schemas.BifrostChatRequest{
+		Input: []schemas.ChatMessage{
+			newTextMessage("describe this"),
+			{Role: schemas.ChatMessageRoleUser, Content: &schemas.ChatMessageContent{
+				ContentBlocks: []schemas.ChatContentBlock{{
+					Type:           schemas.ChatContentBlockTypeImage,
+					ImageURLStruct: &schemas.ChatInputImage{URL: dataURL},
+				}},
+			}},
+		},
+	}}
+	body := chatBody(t, req)
+
+	p := New()
+	headers := runWithTransport(t, p, req, body, "/v1/chat/completions")
+	bodyEst, _ := strconv.ParseInt(headers[headerPrefix+"bodyest"], 10, 64)
+
+	// The image is ~1 MB of base64 ASCII. Priced as text it would be hundreds
+	// of thousands of tokens; priced by modality it is ~1.6k plus the tiny text.
+	if bodyEst > 4*imageTokens {
+		t.Errorf("bodyest=%d for a 1 MB inline image: media bytes were counted as text",
+			bodyEst)
+	}
+	// And it must agree with the marshal path, which already subtracts media.
+	marshalEst := p.EstimateTokens(req)
+	ratio := float64(bodyEst) / float64(max(marshalEst, 1))
+	if ratio < 0.5 || ratio > 2.0 {
+		t.Errorf("bodyest=%d marshalest=%d: the two media accountings disagree", bodyEst, marshalEst)
+	}
+}
+
 func TestTransportHookSkipsNonInferencePaths(t *testing.T) {
 	t.Parallel()
 
