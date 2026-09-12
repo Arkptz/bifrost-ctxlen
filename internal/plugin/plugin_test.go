@@ -23,11 +23,22 @@ func chatRequest(approxTokens int) *schemas.BifrostRequest {
 	}
 }
 
+// scopedContext builds a context the way the host does before calling the hook:
+// scoped to this plugin, so ctx.Log records instead of silently doing nothing.
+// See core/bifrost.go, which wraps every PreRequestHook call in WithPluginScope.
+func scopedContext(t *testing.T) (root, scoped *schemas.BifrostContext) {
+	t.Helper()
+
+	name := Name
+	root = schemas.NewBifrostContext(t.Context(), time.Now())
+	return root, root.WithPluginScope(&name)
+}
+
 // headerValue runs the hook and returns what it published.
 func headerValue(t *testing.T, p *Plugin, req *schemas.BifrostRequest, seed map[string]string) string {
 	t.Helper()
 
-	ctx := schemas.NewBifrostContext(t.Context(), time.Now())
+	_, ctx := scopedContext(t)
 	if seed != nil {
 		ctx.SetValue(schemas.BifrostContextKeyRequestHeaders, seed)
 	}
@@ -306,7 +317,7 @@ func TestPreRequestHookPreservesOtherHeaders(t *testing.T) {
 	t.Parallel()
 
 	p := New()
-	ctx := schemas.NewBifrostContext(t.Context(), time.Now())
+	_, ctx := scopedContext(t)
 	ctx.SetValue(schemas.BifrostContextKeyRequestHeaders, map[string]string{"user-agent": "curl/8"})
 
 	if err := p.PreRequestHook(ctx, chatRequest(10)); err != nil {
@@ -326,7 +337,7 @@ func TestPreRequestHookDoesNotMutateTheExistingMap(t *testing.T) {
 	// must publish a new one rather than write into the old.
 	p := New()
 	original := map[string]string{"user-agent": "curl/8"}
-	ctx := schemas.NewBifrostContext(t.Context(), time.Now())
+	_, ctx := scopedContext(t)
 	ctx.SetValue(schemas.BifrostContextKeyRequestHeaders, original)
 
 	if err := p.PreRequestHook(ctx, chatRequest(10)); err != nil {

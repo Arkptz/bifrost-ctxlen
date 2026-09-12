@@ -30,6 +30,8 @@ import (
 	"fmt"
 	"maps"
 	"strconv"
+	"strings"
+	"sync"
 	"sync/atomic"
 
 	"github.com/maximhq/bifrost/core/schemas"
@@ -119,6 +121,25 @@ const (
 	base64Denominator = 4
 )
 
+// Request families, as published. A closed set on purpose: every value written
+// to a header or a log line must be one this plugin chose, never a string that
+// arrived with the request.
+const (
+	kindChat      = "chat"
+	kindResponses = "responses"
+	kindOther     = "other"
+)
+
+// headerPrefix namespaces the breakdown headers. The total keeps its own name
+// (defaultHeader) because routing rules already compare it and renaming it would
+// break them.
+const headerPrefix = "x-ctxlen-"
+
+// logSchema prefixes every log line. It is both the grep anchor and the format
+// version: a consumer that parses these lines can refuse a version it does not
+// know, instead of silently misreading a reordered field.
+const logSchema = "ctxlen/1"
+
 // Plugin measures requests and publishes the estimate.
 //
 // The header name is atomic because PUT /api/plugins/<name> rewrites the config
@@ -126,6 +147,9 @@ const (
 // a data race.
 type Plugin struct {
 	header atomic.Value // string
+
+	// verifyOnce gates the one-shot check that ctx.Log is actually recording.
+	verifyOnce sync.Once
 }
 
 // New returns a plugin with defaults applied. Init may override them.
@@ -181,7 +205,55 @@ func (p *Plugin) Header() string {
 	return header
 }
 
+// Estimate is one request's measurement: the answer, and every input the
+// arithmetic used to reach it.
+//
+// The breakdown is carried rather than discarded because the estimate is
+// otherwise invisible in production — nothing downstream logs it, and a routing
+// rule only ever reveals which side of a threshold it landed on. Publishing the
+// inputs makes the constants checkable against what the provider actually
+// billed, and lets a future calibration be assembled from production instead of
+// from a replayed capture.
+//
+// The invariant a reader can check by eye: Total == Text + Framing + Media.
+type Estimate struct {
+	Total int64
+
+	// Kind is the request family, from a closed set: "chat", "responses" or
+	// "other". Never a model or provider name — see publish().
+	Kind string
+
+	Messages     int64
+	Tools        int64
+	Instructions int64
+
+	// ASCIIBytes and NonASCIIBytes are of the serialized payload, with media
+	// bytes already removed from ASCIIBytes. MediaBytes is what was removed.
+	ASCIIBytes    int64
+	NonASCIIBytes int64
+	MediaBytes    int64
+
+	Text    int64
+	Framing int64
+	Media   int64
+
+	Images     int64
+	AudioClips int64
+	InlineDocs int64
+	RemoteDocs int64
+
+	// Unmeasurable marks a payload that would not serialize. The estimate is
+	// then zero, which makes a large request look small — the failure this
+	// plugin exists to prevent — so it is reported rather than swallowed.
+	Unmeasurable bool
+}
+
 // EstimateTokens approximates the token count of a request.
+func (p *Plugin) EstimateTokens(req *schemas.BifrostRequest) int64 {
+	return p.Estimate(req).Total
+}
+
+// Estimate measures a request and returns the full breakdown.
 //
 // What is measured is the prompt: the messages, the tool definitions and the
 // system instructions, which are what actually occupies the context window. A
@@ -192,9 +264,9 @@ func (p *Plugin) Header() string {
 // provider bills an image, an audio clip or a PDF by the characters that
 // carried it. Those parts are subtracted from the byte count and priced by
 // modality instead — see mediaCost.
-func (p *Plugin) EstimateTokens(req *schemas.BifrostRequest) int64 {
+func (p *Plugin) Estimate(req *schemas.BifrostRequest) Estimate {
 	if req == nil {
-		return 0
+		return Estimate{Kind: kindOther}
 	}
 
 	// Tool definitions and the system instructions are part of the prompt and
@@ -203,34 +275,44 @@ func (p *Plugin) EstimateTokens(req *schemas.BifrostRequest) int64 {
 	// requests this plugin exists to catch.
 	var payload []any
 	var media mediaCost
-	var messages int
+	out := Estimate{Kind: kindOther}
+
 	switch {
 	case req.ChatRequest != nil:
+		out.Kind = kindChat
 		payload = append(payload, req.ChatRequest.Input)
 		if params := req.ChatRequest.Params; params != nil {
 			payload = append(payload, params.Tools)
+			out.Tools = int64(len(params.Tools))
 		}
 		media = chatMediaCost(req.ChatRequest.Input)
-		messages = len(req.ChatRequest.Input)
+		out.Messages = int64(len(req.ChatRequest.Input))
 	case req.ResponsesRequest != nil:
+		out.Kind = kindResponses
 		payload = append(payload, req.ResponsesRequest.Input)
 		if params := req.ResponsesRequest.Params; params != nil {
 			payload = append(payload, params.Tools, params.Instructions)
+			out.Tools = int64(len(params.Tools))
+			if params.Instructions != nil {
+				out.Instructions = 1
+			}
 		}
 		media = responsesMediaCost(req.ResponsesRequest.Input)
-		messages = len(req.ResponsesRequest.Input)
+		out.Messages = int64(len(req.ResponsesRequest.Input))
 	default:
 		// Embeddings, transcription, image generation and the rest are not
 		// context-window bound in the way this plugin cares about.
-		return 0
+		return out
 	}
 
 	encoded, err := json.Marshal(payload)
 	if err != nil {
-		// An unmarshallable payload is not this plugin's problem to report:
-		// treating it as "not large" lets the request proceed and fail (or
-		// succeed) on its own terms downstream.
-		return 0
+		// An unmarshallable payload is not this plugin's problem to fix, but it
+		// IS one to report: the request proceeds and fails (or succeeds) on its
+		// own terms downstream, while the estimate of zero would silently route
+		// it as small.
+		out.Unmeasurable = true
+		return out
 	}
 
 	ascii, nonASCII := countByteClasses(encoded)
@@ -238,11 +320,23 @@ func (p *Plugin) EstimateTokens(req *schemas.BifrostRequest) int64 {
 	// Media bytes are removed from the text estimate — they are priced by
 	// modality instead. They come off the ASCII side because base64 and URLs
 	// are ASCII; clamped at zero so a miscount can never make text negative.
-	ascii = max(ascii-media.bytes, 0)
+	out.ASCIIBytes = max(ascii-media.bytes, 0)
+	out.NonASCIIBytes = nonASCII
+	out.MediaBytes = media.bytes
 
-	text := float64(ascii)/asciiBytesPerToken + float64(nonASCII)/nonASCIIBytesPerToken
+	out.Text = int64(float64(out.ASCIIBytes)/asciiBytesPerToken +
+		float64(out.NonASCIIBytes)/nonASCIIBytesPerToken)
+	out.Framing = out.Messages * tokensPerMessage
+	out.Media = media.tokens
 
-	return int64(text) + int64(messages)*tokensPerMessage + media.tokens
+	out.Images = media.images
+	out.AudioClips = media.audioClips
+	out.InlineDocs = media.inlineDocs
+	out.RemoteDocs = media.remoteDocs
+
+	out.Total = out.Text + out.Framing + out.Media
+
+	return out
 }
 
 // countByteClasses splits a UTF-8 buffer into ASCII and non-ASCII byte counts.
@@ -265,25 +359,41 @@ func countByteClasses(b []byte) (ascii, nonASCII int64) {
 
 // mediaCost is what the non-text parts of a payload contribute: the serialized
 // bytes they occupy (to be removed from the text estimate) and the tokens a
-// provider will actually bill for them.
+// provider will actually bill for them. The per-modality counts are carried so
+// the published breakdown can be checked against the provider's own
+// prompt_tokens_details, which reports image and audio tokens separately.
 type mediaCost struct {
 	bytes  int64
 	tokens int64
+
+	images     int64
+	audioClips int64
+	inlineDocs int64
+	remoteDocs int64
 }
 
-func (m *mediaCost) addInline(payload string, bytesPerToken int64) {
+func (m *mediaCost) addAudio(payload string) {
 	m.bytes += int64(len(payload))
-	m.tokens += decodedSize(payload) / bytesPerToken
+	m.tokens += decodedSize(payload) / audioBytesPerToken
+	m.audioClips++
+}
+
+func (m *mediaCost) addInlineDocument(payload string) {
+	m.bytes += int64(len(payload))
+	m.tokens += decodedSize(payload) / fileBytesPerToken
+	m.inlineDocs++
 }
 
 func (m *mediaCost) addImage(reference string) {
 	m.bytes += int64(len(reference))
 	m.tokens += imageTokens
+	m.images++
 }
 
 func (m *mediaCost) addRemoteFile(reference string) {
 	m.bytes += int64(len(reference))
 	m.tokens += remoteFileTokens
+	m.remoteDocs++
 }
 
 // decodedSize is the byte length a base64 payload decodes to. A payload that is
@@ -300,7 +410,7 @@ func chatMediaCost(messages []schemas.ChatMessage) mediaCost {
 		if message.ChatAssistantMessage != nil && message.Audio != nil {
 			// Audio the model produced, replayed as history: it occupies the
 			// context window exactly like audio the client sent.
-			cost.addInline(message.Audio.Data, audioBytesPerToken)
+			cost.addAudio(message.Audio.Data)
 		}
 
 		if message.Content == nil {
@@ -311,11 +421,11 @@ func chatMediaCost(messages []schemas.ChatMessage) mediaCost {
 			case block.ImageURLStruct != nil:
 				cost.addImage(block.ImageURLStruct.URL)
 			case block.InputAudio != nil:
-				cost.addInline(block.InputAudio.Data, audioBytesPerToken)
+				cost.addAudio(block.InputAudio.Data)
 			case block.File != nil:
 				switch {
 				case block.File.FileData != nil:
-					cost.addInline(*block.File.FileData, fileBytesPerToken)
+					cost.addInlineDocument(*block.File.FileData)
 				case block.File.FileURL != nil:
 					cost.addRemoteFile(*block.File.FileURL)
 				case block.File.FileID != nil:
@@ -344,11 +454,11 @@ func responsesMediaCost(messages []schemas.ResponsesMessage) mediaCost {
 					cost.addImage("")
 				}
 			case block.Audio != nil:
-				cost.addInline(block.Audio.Data, audioBytesPerToken)
+				cost.addAudio(block.Audio.Data)
 			case block.ResponsesInputMessageContentBlockFile != nil:
 				switch {
 				case block.FileData != nil:
-					cost.addInline(*block.FileData, fileBytesPerToken)
+					cost.addInlineDocument(*block.FileData)
 				case block.FileURL != nil:
 					cost.addRemoteFile(*block.FileURL)
 				case block.FileID != nil:
@@ -361,14 +471,77 @@ func responsesMediaCost(messages []schemas.ResponsesMessage) mediaCost {
 	return cost
 }
 
-// PreRequestHook measures the request and publishes the estimate as a header.
+// field is one published measurement. The same set feeds the headers and the
+// log line, so the two can never disagree about what was measured.
+//
+// Every value is an integer except kind, which is drawn from a closed set. That
+// is a mechanical guarantee rather than a convention: nothing derived from
+// request content — no message text, no tool name, no URL — can reach a header
+// or a log line, so neither can leak content nor be forged by a client that
+// names a tool `x est=1` to corrupt a drift query.
+type field struct {
+	name  string
+	value int64
+}
+
+func (e Estimate) fields() []field {
+	return []field{
+		{"msgs", e.Messages},
+		{"tools", e.Tools},
+		{"sys", e.Instructions},
+		{"ascii", e.ASCIIBytes},
+		{"nonascii", e.NonASCIIBytes},
+		{"mediab", e.MediaBytes},
+		{"text", e.Text},
+		{"frame", e.Framing},
+		{"media", e.Media},
+		{"img", e.Images},
+		{"audio", e.AudioClips},
+		{"doc", e.InlineDocs},
+		{"docurl", e.RemoteDocs},
+	}
+}
+
+// logLine renders the estimate as one line for the admin UI's Plugin Logs tab.
+//
+// Fixed arity: every field is printed, zeros included. Three extra bytes are
+// cheaper than an awk script that silently shifts a column on a request that
+// happened to carry no images.
+func (e Estimate) logLine() string {
+	var b strings.Builder
+	b.Grow(192)
+
+	b.WriteString(logSchema)
+	if e.Unmeasurable {
+		// Distinguished by the second token, so a parser can branch before it
+		// looks for est=.
+		b.WriteString(" warn=payload_unmarshalable kind=")
+		b.WriteString(e.Kind)
+		return b.String()
+	}
+
+	b.WriteString(" est=")
+	b.WriteString(strconv.FormatInt(e.Total, 10))
+	b.WriteString(" kind=")
+	b.WriteString(e.Kind)
+	for _, f := range e.fields() {
+		b.WriteByte(' ')
+		b.WriteString(f.name)
+		b.WriteByte('=')
+		b.WriteString(strconv.FormatInt(f.value, 10))
+	}
+
+	return b.String()
+}
+
+// PreRequestHook measures the request and publishes the estimate.
 //
 // Registration must set "placement": "pre_builtin", otherwise this runs AFTER
 // the routing plugin and the header arrives too late to affect anything.
 //
 // Two details matter more than they look:
 //
-// The header is written on EVERY request, "0" included. The map starts as a
+// The headers are written on EVERY request, "0" included. The map starts as a
 // copy of the client's own headers, so a value written only for large requests
 // would let any caller send their own count and route themselves. Overwriting
 // unconditionally makes the client's value irrelevant.
@@ -380,18 +553,54 @@ func (p *Plugin) PreRequestHook(ctx *schemas.BifrostContext, req *schemas.Bifros
 		return nil
 	}
 
-	value := strconv.FormatInt(p.EstimateTokens(req), 10)
+	estimate := p.Estimate(req)
 
 	existing, _ := ctx.Value(schemas.BifrostContextKeyRequestHeaders).(map[string]string)
-	headers := make(map[string]string, len(existing)+1)
+	headers := make(map[string]string, len(existing)+2+len(estimate.fields()))
 	maps.Copy(headers, existing)
 	// Keys are lowercased by the transport, and the routing engine lowercases
 	// both sides before matching; keep that invariant.
-	headers[p.Header()] = value
+	headers[p.Header()] = strconv.FormatInt(estimate.Total, 10)
+	headers[headerPrefix+"kind"] = estimate.Kind
+	for _, f := range estimate.fields() {
+		headers[headerPrefix+f.name] = strconv.FormatInt(f.value, 10)
+	}
 
 	ctx.SetValue(schemas.BifrostContextKeyRequestHeaders, headers)
 
-	return nil
+	// Publish the measurement where an operator can see it. Two channels on
+	// purpose: the log line is forensics for one request in the admin UI, the
+	// trace attribute is the aggregate in OTEL/Langfuse.
+	ctx.Log(schemas.LogLevelInfo, estimate.logLine())
+	ctx.SetTraceAttribute("ctxlen.estimate", estimate.Total)
+
+	// ctx.Log is a SILENT no-op on a context the host did not scope to this
+	// plugin (core/schemas/context.go: it returns early when pluginScope is
+	// nil). That is the failure mode this instrumentation exists to prevent —
+	// code that looks instrumented and emits nothing — so prove once per
+	// process that the write lands, and report it through the one channel that
+	// still works when logging does not: the hook's error return. It is
+	// non-blocking (core/bifrost.go logs it and continues), and it runs after
+	// the headers are published, so the measurement itself still happens.
+	return p.verifyLogging(ctx)
+}
+
+// verifyLogging checks, once per process, that ctx.Log actually records.
+//
+// Once and not per-request: GetPluginLogs deep-copies the whole slice, which is
+// free at startup and wasteful on every request.
+func (p *Plugin) verifyLogging(ctx *schemas.BifrostContext) error {
+	var err error
+	p.verifyOnce.Do(func() {
+		for _, entry := range ctx.GetPluginLogs() {
+			if entry.PluginName == Name {
+				return
+			}
+		}
+		err = fmt.Errorf("%s: ctx.Log recorded nothing — the host is not scoping "+
+			"PreRequestHook contexts to the plugin, so every estimate is unobservable", Name)
+	})
+	return err
 }
 
 // Cleanup runs at shutdown. This plugin holds no resources.

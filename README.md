@@ -59,6 +59,69 @@ configure: that lives in the rules.
 
 Then add a routing rule comparing `int(headers["x-ctx-tokens"])`.
 
+## Seeing what it measured
+
+The estimate used to be invisible in production: Bifrost does not log inbound
+headers, and the routing engine's trace prints `x-ctx-tokens=<present>` without
+the value — deliberately, since headers carry credentials. So an estimator that
+drifted stayed wrong until someone stood up a gateway with a mock upstream to
+read the number back. It now publishes itself two ways.
+
+**In the admin UI**, one line per request on the request's *Plugin Logs* tab:
+
+```text
+ctxlen/1 est=120015 kind=chat msgs=1 tools=0 sys=0 ascii=306032 nonascii=0 \
+  mediab=0 text=120012 frame=3 media=0 img=0 audio=0 doc=0 docurl=0
+```
+
+`ctxlen/1` is both the grep anchor and the schema version. The line carries the
+answer *and every input the arithmetic used*, so the constants are checkable
+without access to the content: `est = text + frame + media`, and `frame = msgs*3`.
+A payload that will not serialize logs `warn=payload_unmarshalable` instead of
+an `est=` — that case estimates to zero, which would make a large request look
+small.
+
+**As headers**, every field above under `x-ctxlen-`, so a rule can compare any
+of them and not just the total:
+
+```text
+int(headers["x-ctxlen-nonascii"]) > 0      ->  the prompt is not plain English
+int(headers["x-ctxlen-img"]) > 4           ->  an image-heavy request
+```
+
+Every published value is an integer, except `kind`, which comes from a closed
+set (`chat`, `responses`, `other`). That is mechanical, not a convention: no
+message text, tool name or URL can reach a header or a log line. It keeps
+content out of a Postgres table humans query — and it stops a client that names
+a tool `x est=1` from forging a field in the drift query below.
+
+### Watching for drift
+
+The gateway records the provider's billed `prompt_tokens` as a plain column on
+the same log row, and neither it nor `plugin_logs` is offloaded, so the ratio is
+one query with no join:
+
+```sql
+SELECT model,
+       percentile_cont(0.5)  WITHIN GROUP (ORDER BY est::numeric / prompt_tokens) AS p50,
+       percentile_cont(0.95) WITHIN GROUP (ORDER BY est::numeric / prompt_tokens) AS p95,
+       count(*)
+FROM (SELECT model, prompt_tokens,
+             substring(plugin_logs from 'ctxlen/1 est=([0-9]+)') AS est
+      FROM logs
+      WHERE timestamp > now() - interval '7 days' AND prompt_tokens > 0) t
+WHERE est IS NOT NULL
+GROUP BY model;
+```
+
+Alert when p95 leaves ±10%, the band the calibration test enforces. The same
+fields are what `testdata/calibration.json` holds, so the next calibration can
+be assembled from production rather than from a captured replay.
+
+The total also goes out as the `ctxlen.estimate` trace attribute, for OTEL and
+Langfuse. Logs are forensics for one request; the trace attribute is the
+aggregate.
+
 ## How the measurement works
 
 Text is priced per byte class, and the whole prompt is measured: messages, tool
@@ -129,7 +192,15 @@ unconditionally makes the client's value irrelevant — and a rule comparing
 **The map is replaced, not mutated.** It is shared with other hooks and read
 concurrently, so writing into the existing map is a data race.
 
-Both are covered by tests.
+**Logging is verified, once, at runtime.** `ctx.Log` is a silent no-op on a
+context the host did not scope to the plugin — code that looks instrumented and
+emits nothing, which is the failure this instrumentation exists to prevent. The
+first request after startup checks that the write landed and, if it did not,
+returns an error from the hook: the one channel that still works when logging
+does not. It is non-blocking and runs after the headers are published, so a
+broken gateway upgrade costs observability, never routing.
+
+All three are covered by tests.
 
 ## Before deploying
 
