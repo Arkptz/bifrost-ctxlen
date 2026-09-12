@@ -60,32 +60,31 @@ func TestTransportHookMeasuresTheBody(t *testing.T) {
 	req := chatRequest(10_000)
 	body := chatBody(t, req)
 
+	// x-ctx-tokens is now derived from the body the transport hook measured.
 	headers := runWithTransport(t, p, req, body, "/v1/chat/completions")
-
-	bodyEst, err := strconv.ParseInt(headers[headerPrefix+"bodyest"], 10, 64)
+	bodyRouted, err := strconv.ParseInt(headers[p.Header()], 10, 64)
 	if err != nil {
-		t.Fatalf("bodyest = %q, not an integer: %v", headers[headerPrefix+"bodyest"], err)
+		t.Fatalf("%s = %q, not an integer: %v", p.Header(), headers[p.Header()], err)
 	}
-	if bodyEst == 0 {
-		t.Fatal("bodyest = 0: the transport hook did not measure the body")
+	if bodyRouted == 0 {
+		t.Fatal("estimate = 0: the transport hook did not measure the body")
 	}
 
-	// The body path and the marshal path measure slightly different things
-	// (the body carries top-level params, the marshal does not), but for a
-	// text-only request they must land within a few percent — that closeness is
-	// the whole premise of replacing one with the other.
-	marshalEst, _ := strconv.ParseInt(headers[p.Header()], 10, 64)
-	ratio := float64(bodyEst) / float64(marshalEst)
-	if ratio < 0.9 || ratio > 1.15 {
-		t.Errorf("bodyest=%d marshalest=%d (ratio %.3f): the two paths disagree by more than the shadow window",
-			bodyEst, marshalEst, ratio)
+	// The body path and the marshal fallback measure slightly different things
+	// (the body carries top-level params), but for a text-only request they
+	// land within a few points — that closeness is the premise of the swap.
+	marshalOnly := p.EstimateTokens(req)
+	ratio := float64(bodyRouted) / float64(marshalOnly)
+	if ratio < 0.9 || ratio > 1.2 {
+		t.Errorf("body-routed=%d marshal=%d (ratio %.3f): the two paths disagree too much",
+			bodyRouted, marshalOnly, ratio)
 	}
 }
 
 // TestBodyEstimateSubtractsInlineMedia is the regression for a real defect: the
 // raw body carries inline base64 in full, and counting it as text priced a 1 MB
-// screenshot as ~350k tokens. The body estimate must subtract media the same way
-// the marshal estimate does.
+// screenshot as ~350k tokens. The body path must subtract media the same way the
+// marshal path does.
 func TestBodyEstimateSubtractsInlineMedia(t *testing.T) {
 	t.Parallel()
 
@@ -106,19 +105,18 @@ func TestBodyEstimateSubtractsInlineMedia(t *testing.T) {
 
 	p := New()
 	headers := runWithTransport(t, p, req, body, "/v1/chat/completions")
-	bodyEst, _ := strconv.ParseInt(headers[headerPrefix+"bodyest"], 10, 64)
+	routed, _ := strconv.ParseInt(headers[p.Header()], 10, 64)
 
 	// The image is ~1 MB of base64 ASCII. Priced as text it would be hundreds
 	// of thousands of tokens; priced by modality it is ~1.6k plus the tiny text.
-	if bodyEst > 4*imageTokens {
-		t.Errorf("bodyest=%d for a 1 MB inline image: media bytes were counted as text",
-			bodyEst)
+	if routed > 4*imageTokens {
+		t.Errorf("estimate=%d for a 1 MB inline image: media bytes were counted as text", routed)
 	}
-	// And it must agree with the marshal path, which already subtracts media.
-	marshalEst := p.EstimateTokens(req)
-	ratio := float64(bodyEst) / float64(max(marshalEst, 1))
+	// And it must agree with the marshal fallback, which also subtracts media.
+	marshalOnly := p.EstimateTokens(req)
+	ratio := float64(routed) / float64(max(marshalOnly, 1))
 	if ratio < 0.5 || ratio > 2.0 {
-		t.Errorf("bodyest=%d marshalest=%d: the two media accountings disagree", bodyEst, marshalEst)
+		t.Errorf("body=%d marshal=%d: the two media accountings disagree", routed, marshalOnly)
 	}
 }
 

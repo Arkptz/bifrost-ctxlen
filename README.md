@@ -101,9 +101,6 @@ of them and not just the total.
 | `x-ctxlen-audio` | Number of audio clips. |
 | `x-ctxlen-doc` | Number of inline documents. |
 | `x-ctxlen-docurl` | Number of documents referenced by URL or file id. |
-| `x-ctxlen-bodyascii` | ASCII bytes of the RAW body, media excluded (shadow). |
-| `x-ctxlen-bodynonascii` | Non-ASCII bytes of the raw body (shadow). |
-| `x-ctxlen-bodyest` | The estimate computed from the raw body (shadow). |
 
 `x-ctx-tokens` satisfies `text + frame + media`. Every value is a decimal
 integer except `kind`, so a rule converts with `int()`.
@@ -172,13 +169,11 @@ against billed tokens over the calibration corpus they agree to within hundredth
 of a percent, because JSON escaping never touches valid non-ASCII and the ASCII
 overhead is a stable fraction the constants already absorb.
 
-Both counts are published: `x-ctx-tokens` (and the `x-ctxlen-*` breakdown) is the
-authoritative marshal-derived number, while `x-ctxlen-bodyest` /
-`x-ctxlen-bodyascii` / `x-ctxlen-bodynonascii` carry the body measurement in
-shadow. The body path subtracts inline media the same way the marshal path does,
-so an inline image is priced by modality in both. Publishing both is what lets
-the body path be verified against billed tokens on live traffic before it
-becomes authoritative.
+The body measurement is what `x-ctx-tokens` reports. It subtracts inline media
+the same way the serializing path does, so an image is priced by modality rather
+than by the megabyte of base64 that carried it. Serializing survives only as a
+fallback for a caller that arrives without the transport hook — an SDK embedding
+or a realtime websocket.
 
 ## How the measurement works
 
