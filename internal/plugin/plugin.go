@@ -242,10 +242,34 @@ type Estimate struct {
 	InlineDocs int64
 	RemoteDocs int64
 
+	// BodyASCIIBytes and BodyNonASCIIBytes are the same two counts taken from
+	// the RAW request body, before Bifrost parsed it, by the transport hook.
+	// Zero when that hook did not run or the body was not retained.
+	//
+	// Measuring the body costs one linear scan, against a json.Marshal of the
+	// whole payload — 76% of this plugin's cost and effectively all of its
+	// allocations. They are carried alongside the marshal-derived counts, not
+	// instead of them, because the two measure slightly different things: the
+	// body includes top-level parameters and the CLIENT's escaping rather than
+	// Go's. Publishing both is what lets the pricing constants be re-fitted
+	// against real traffic before the cheap path becomes the authoritative one.
+	BodyASCIIBytes    int64
+	BodyNonASCIIBytes int64
+
 	// Unmeasurable marks a payload that would not serialize. The estimate is
 	// then zero, which makes a large request look small — the failure this
 	// plugin exists to prevent — so it is reported rather than swallowed.
 	Unmeasurable bool
+}
+
+// priceText converts counted bytes into tokens.
+//
+// Split out from the measurement so the calibration fixture can exercise the
+// pricing law directly, on recorded byte counts, without reconstructing a
+// request and re-serializing it. The fixture then pins what the constants
+// claim rather than how the bytes were obtained.
+func priceText(ascii, nonASCII int64) int64 {
+	return int64(float64(ascii)/asciiBytesPerToken + float64(nonASCII)/nonASCIIBytesPerToken)
 }
 
 // EstimateTokens approximates the token count of a request.
@@ -324,8 +348,7 @@ func (p *Plugin) Estimate(req *schemas.BifrostRequest) Estimate {
 	out.NonASCIIBytes = nonASCII
 	out.MediaBytes = media.bytes
 
-	out.Text = int64(float64(out.ASCIIBytes)/asciiBytesPerToken +
-		float64(out.NonASCIIBytes)/nonASCIIBytesPerToken)
+	out.Text = priceText(out.ASCIIBytes, out.NonASCIIBytes)
 	out.Framing = out.Messages * tokensPerMessage
 	out.Media = media.tokens
 
@@ -499,6 +522,11 @@ func (e Estimate) fields() []field {
 		{"audio", e.AudioClips},
 		{"doc", e.InlineDocs},
 		{"docurl", e.RemoteDocs},
+		// Shadow counts from the raw body. Published so the cheap path can be
+		// calibrated against billed tokens before it replaces the marshal.
+		{"bodyascii", e.BodyASCIIBytes},
+		{"bodynonascii", e.BodyNonASCIIBytes},
+		{"bodyest", priceText(e.BodyASCIIBytes, e.BodyNonASCIIBytes) + e.Framing + e.Media},
 	}
 }
 
@@ -554,6 +582,24 @@ func (p *Plugin) PreRequestHook(ctx *schemas.BifrostContext, req *schemas.Bifros
 	}
 
 	estimate := p.Estimate(req)
+
+	// Shadow measurement: the transport hook counted the raw body, which costs
+	// one linear scan instead of the json.Marshal above. It is published but
+	// NOT yet authoritative — the pricing constants were fitted to marshal
+	// bytes, and the body is a slightly different quantity (top-level
+	// parameters included, the client's escaping rather than Go's). Publishing
+	// both is what lets the constants be re-fitted from production traffic
+	// before the cheap path takes over.
+	if size, ok := bodyMeasurement(ctx); ok {
+		estimate.BodyASCIIBytes = size.ascii
+		estimate.BodyNonASCIIBytes = size.nonASCII
+		if size.ascii == 0 && size.nonASCII == 0 && size.contentLength > 0 {
+			// Body not retained (over the large-payload threshold, or chunked).
+			// Treat the declared length as ASCII: such a request is above any
+			// sane routing threshold, so erring high is the safe direction.
+			estimate.BodyASCIIBytes = size.contentLength
+		}
+	}
 
 	existing, _ := ctx.Value(schemas.BifrostContextKeyRequestHeaders).(map[string]string)
 	headers := make(map[string]string, len(existing)+2+len(estimate.fields()))

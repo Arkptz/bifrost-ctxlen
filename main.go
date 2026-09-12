@@ -36,5 +36,12 @@ func PreRequestHook(ctx *schemas.BifrostContext, req *schemas.BifrostRequest) er
 	return instance.PreRequestHook(ctx, req)
 }
 
+// HTTPTransportPreHook runs at the HTTP transport layer, before Bifrost parses
+// the body. It measures the raw bytes so the estimate does not have to
+// re-serialize the parsed request. OPTIONAL.
+func HTTPTransportPreHook(ctx *schemas.BifrostContext, req *schemas.HTTPRequest) (*schemas.HTTPResponse, error) {
+	return instance.HTTPTransportPreHook(ctx, req)
+}
+
 // Cleanup runs at shutdown. REQUIRED by the loader.
 func Cleanup() error { return instance.Cleanup() }

@@ -15,10 +15,14 @@ import "github.com/maximhq/bifrost/core/schemas"
 // Add a line here for every hook you export. The signatures come from
 // framework/plugins/soloader.go, which is the only authority on them.
 var (
-	_ func() string    = GetName
-	_ func() error     = Cleanup
-	_ func(any) error  = Init
-	_ preRequestHookFn = PreRequestHook
+	_ func() string          = GetName
+	_ func() error           = Cleanup
+	_ func(any) error        = Init
+	_ preRequestHookFn       = PreRequestHook
+	_ httpTransportPreHookFn = HTTPTransportPreHook
 )
 
-type preRequestHookFn = func(*schemas.BifrostContext, *schemas.BifrostRequest) error
+type (
+	preRequestHookFn       = func(*schemas.BifrostContext, *schemas.BifrostRequest) error
+	httpTransportPreHookFn = func(*schemas.BifrostContext, *schemas.HTTPRequest) (*schemas.HTTPResponse, error)
+)

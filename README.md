@@ -122,6 +122,30 @@ The total also goes out as the `ctxlen.estimate` trace attribute, for OTEL and
 Langfuse. Logs are forensics for one request; the trace attribute is the
 aggregate.
 
+## Where the bytes come from
+
+The size is measured from the **raw request body**, before Bifrost parses it, in
+an `HTTPTransportPreHook`. The obvious alternative — serialize the parsed structs
+and count that — cost a `json.Marshal` of the whole payload on every request:
+9x this plugin's total time and effectively all of its allocations, to
+reproduce bytes that were already on the wire. The transport layer has them, and
+copies them on every request whether or not this hook is exported (a loaded
+`.so` registers as an HTTP transport plugin regardless), so that copy was paid
+for and thrown away. Measured against the marshal it replaces: 711 µs → 75 µs at
+220 kB, 4.0 ms → 0.5 ms at 1.4 MB, and zero allocations either way.
+
+The body and a marshal measure slightly different things — the body carries
+top-level parameters and the client's own escaping rather than Go's — but priced
+against billed tokens over the calibration corpus they agree to within hundredths
+of a percent, because JSON escaping never touches valid non-ASCII and the ASCII
+overhead is a stable fraction the constants already absorb.
+
+Both counts are published: `x-ctx-tokens` (and the `x-ctxlen-*` breakdown) is the
+authoritative marshal-derived number, while `x-ctxlen-bodyest` /
+`x-ctxlen-bodyascii` / `x-ctxlen-bodynonascii` carry the body measurement in
+shadow. Publishing both is what lets the body path be verified against billed
+tokens on live traffic before it becomes authoritative.
+
 ## How the measurement works
 
 Text is priced per byte class, and the whole prompt is measured: messages, tool
