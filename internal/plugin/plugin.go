@@ -72,8 +72,30 @@ const (
 	// mean a heavyweight dependency, per-model vocabularies, and — the part
 	// that actually bites — any library also linked by the host widens the
 	// shared-package surface that Go's plugin runtime version-checks.
-	asciiBytesPerToken    = 2.55
-	nonASCIIBytesPerToken = 3.85
+	asciiBytesPerToken = 2.55
+
+	// Non-ASCII is split by UTF-8 SEQUENCE LENGTH, because bytes-per-token is
+	// not one number across scripts — it ranges about 4.5x, and a single
+	// divisor mispriced whichever script it was not fitted to.
+	//
+	// Measured bytes-per-token (FLORES-200 via Petrov et al. NeurIPS 2023 for
+	// cl100k; OpenAI's own published cl100k->o200k comparisons for the rest):
+	//
+	//   2-byte (Cyrillic, Greek, Hebrew)   ~4.3 cl100k, ~5.8 o200k
+	//   3-byte (Han, kana, Hangul)         ~2.1-3.6 cl100k, ~3.6-4.5 o200k
+	//   4-byte (emoji, rare CJK ext.)      ~1.3-2.0 — emoji are the cheapest
+	//                                      text there is per byte, since a ZWJ
+	//                                      sequence has no single token and
+	//                                      shatters into byte fragments
+	//
+	// Each constant sits at or below the low end of its measured range, so the
+	// estimate errs HIGH in tokens — the safe direction, since underestimating
+	// routes an oversized request to a short-context provider and fails it.
+	// twoByteBytesPerToken keeps the value calibrated against this deployment's
+	// own billed tokens, which is dominated by Cyrillic.
+	twoByteBytesPerToken   = 3.85
+	threeByteBytesPerToken = 2.5
+	fourByteBytesPerToken  = 1.5
 
 	// tokensPerMessage is the per-message framing every chat API adds around
 	// content (role markers and separators). OpenAI's cookbook counts 3 tokens
@@ -193,7 +215,19 @@ func (p *Plugin) Init(config any) error {
 		if header == "" {
 			return fmt.Errorf("%s: header must not be empty", Name)
 		}
-		p.header.Store(header)
+		// Lowercased, and this is a security control rather than tidiness.
+		//
+		// The routing engine lowercases every header key before evaluating CEL,
+		// so `X-Ctx-Tokens` and `x-ctx-tokens` collapse to one variable. But the
+		// map this plugin writes into starts as a copy of the CLIENT's headers,
+		// keyed as the transport stored them. Writing under a differently-cased
+		// name therefore leaves the client's own entry in place beside ours, and
+		// which of the two survives the engine's normalisation is a coin toss —
+		// measured at 39% in the client's favour. Storing the key already
+		// lowercased means our write always lands on the same entry the client's
+		// would, so the unconditional overwrite that makes spoofing impossible
+		// actually overwrites.
+		p.header.Store(strings.ToLower(header))
 	}
 
 	return nil
@@ -227,11 +261,11 @@ type Estimate struct {
 	Tools        int64
 	Instructions int64
 
-	// ASCIIBytes and NonASCIIBytes are of the serialized payload, with media
-	// bytes already removed from ASCIIBytes. MediaBytes is what was removed.
-	ASCIIBytes    int64
-	NonASCIIBytes int64
-	MediaBytes    int64
+	// Bytes is the measured payload split by UTF-8 sequence length, with media
+	// bytes already removed from the ASCII bucket. MediaBytes is what was
+	// removed.
+	Bytes      byteClasses
+	MediaBytes int64
 
 	Text    int64
 	Framing int64
@@ -248,14 +282,17 @@ type Estimate struct {
 	Unmeasurable bool
 }
 
-// priceText converts counted bytes into tokens.
+// priceText converts counted bytes into tokens, per byte class.
 //
 // Split out from the measurement so the calibration fixture can exercise the
 // pricing law directly, on recorded byte counts, without reconstructing a
 // request and re-serializing it. The fixture then pins what the constants
 // claim rather than how the bytes were obtained.
-func priceText(ascii, nonASCII int64) int64 {
-	return int64(float64(ascii)/asciiBytesPerToken + float64(nonASCII)/nonASCIIBytesPerToken)
+func priceText(c byteClasses) int64 {
+	return int64(float64(c.ascii)/asciiBytesPerToken +
+		float64(c.twoByte)/twoByteBytesPerToken +
+		float64(c.threeByte)/threeByteBytesPerToken +
+		float64(c.fourByte)/fourByteBytesPerToken)
 }
 
 // EstimateTokens approximates the token count of a request.
@@ -327,9 +364,14 @@ func (p *Plugin) estimate(req *schemas.BifrostRequest, body *bodySize) Estimate 
 	out.InlineDocs = media.inlineDocs
 	out.RemoteDocs = media.remoteDocs
 
+	// The body is the cheap path, but it is not always usable: a payload the
+	// transport declined to copy leaves nothing to count. Fall through to
+	// serializing rather than publish an estimate derived from an absent body.
+	priced := false
 	if body != nil {
-		out.fromBody(*body, media.bytes)
-	} else if !out.fromMarshal(req, media.bytes) {
+		priced = out.fromBody(*body, media.bytes)
+	}
+	if !priced && !out.fromMarshal(req, media.bytes) {
 		out.Unmeasurable = true
 		return out
 	}
@@ -343,16 +385,34 @@ func (p *Plugin) estimate(req *schemas.BifrostRequest, body *bodySize) Estimate 
 // counted. Media bytes are removed the same way the marshal path removes them:
 // the body carries inline base64 in full, and that is ASCII, so an unremoved
 // image would be priced as hundreds of thousands of tokens of text.
-func (e *Estimate) fromBody(body bodySize, mediaBytes int64) {
-	e.ASCIIBytes = max(body.ascii-mediaBytes, 0)
-	e.NonASCIIBytes = body.nonASCII
-	if body.ascii == 0 && body.nonASCII == 0 && body.contentLength > 0 {
-		// Body not retained (over the large-payload threshold, or chunked).
-		// Treat the declared length as ASCII: such a request is above any sane
-		// routing threshold, so erring high is the safe direction.
-		e.ASCIIBytes = body.contentLength
+//
+// Returns false when the body was not retained and cannot be priced, so the
+// caller falls back to serializing rather than publishing a number derived from
+// an absent body.
+func (e *Estimate) fromBody(body bodySize, mediaBytes int64) bool {
+	if !body.measured {
+		// The transport skipped the copy: over the large-payload threshold, or
+		// a length it could not determine. Content-Length is usually gone by
+		// then too — the decompression middleware deletes it — so the declared
+		// size is not a dependable substitute. Use it only when it is actually
+		// there, and otherwise say so, because a request whose body was too big
+		// to copy is precisely the one that must not read as small.
+		if body.contentLength <= 0 {
+			return false
+		}
+		// Priced as ASCII: no byte-class breakdown exists for a body nobody
+		// read, and ASCII is the cheaper divisor, so this errs high in tokens —
+		// the safe direction for a routing threshold.
+		e.Bytes = byteClasses{ascii: body.contentLength}
+		e.Text = priceText(e.Bytes)
+		return true
 	}
-	e.Text = priceText(e.ASCIIBytes, e.NonASCIIBytes)
+
+	// Media is base64 and URLs — ASCII — so it comes off the ASCII bucket.
+	e.Bytes = body.classes
+	e.Bytes.ascii = max(e.Bytes.ascii-mediaBytes, 0)
+	e.Text = priceText(e.Bytes)
+	return true
 }
 
 // fromMarshal prices the text by serializing the payload, for callers with no
@@ -378,29 +438,61 @@ func (e *Estimate) fromMarshal(req *schemas.BifrostRequest, mediaBytes int64) bo
 	if err != nil {
 		return false
 	}
-	ascii, nonASCII := countByteClasses(encoded)
-	e.ASCIIBytes = max(ascii-mediaBytes, 0)
-	e.NonASCIIBytes = nonASCII
-	e.Text = priceText(e.ASCIIBytes, e.NonASCIIBytes)
+	e.Bytes = countByteClasses(encoded)
+	e.Bytes.ascii = max(e.Bytes.ascii-mediaBytes, 0)
+	e.Text = priceText(e.Bytes)
 	return true
 }
 
-// countByteClasses splits a UTF-8 buffer into ASCII and non-ASCII byte counts.
+// byteClasses is a UTF-8 buffer split by sequence length.
 //
-// The split is the whole point of the estimate: a byte below 0x80 is one
-// character, while a non-ASCII character arrives as two to four bytes, so a
-// single divisor systematically misprices whichever class it was not fitted to.
-// Counting bytes rather than decoding runes keeps this a single linear pass
-// with no allocation, which matters because it runs on every request.
-func countByteClasses(b []byte) (ascii, nonASCII int64) {
-	for _, c := range b {
-		if c < 0x80 {
-			ascii++
-		} else {
-			nonASCII++
+// Four buckets and not two, because bytes-per-token varies about 4.5x across
+// scripts and tracks the UTF-8 length closely: 2-byte scripts tokenize around
+// 4-6 bytes per token, 3-byte CJK around 2-4, and 4-byte emoji below 2, since a
+// ZWJ sequence has no single token and shatters into byte fragments. One
+// non-ASCII divisor therefore misprices whichever script it was not fitted to.
+type byteClasses struct {
+	ascii     int64
+	twoByte   int64
+	threeByte int64
+	fourByte  int64
+}
+
+func (c byteClasses) nonASCII() int64 {
+	return c.twoByte + c.threeByte + c.fourByte
+}
+
+func (c byteClasses) total() int64 {
+	return c.ascii + c.nonASCII()
+}
+
+// countByteClasses splits a UTF-8 buffer by sequence length.
+//
+// It counts LEAD bytes and attributes each sequence's full width to its class,
+// so the buckets sum to the buffer length. Continuation bytes (0b10xxxxxx) are
+// skipped rather than counted separately. Malformed input cannot desynchronise
+// the total: a stray continuation byte falls through to the ASCII bucket, which
+// is the cheapest divisor and therefore the safe direction.
+//
+// A single linear pass with no allocation, which matters because it runs on
+// every request — measured at ~2.9 GB/s.
+func countByteClasses(b []byte) byteClasses {
+	var c byteClasses
+	for _, x := range b {
+		switch {
+		case x < 0x80:
+			c.ascii++
+		case x < 0xC0:
+			// Continuation byte: already accounted for by its lead byte.
+		case x < 0xE0:
+			c.twoByte += 2
+		case x < 0xF0:
+			c.threeByte += 3
+		default:
+			c.fourByte += 4
 		}
 	}
-	return ascii, nonASCII
+	return c
 }
 
 // mediaCost is what the non-text parts of a payload contribute: the serialized
@@ -535,8 +627,13 @@ func (e Estimate) fields() []field {
 		{"msgs", e.Messages},
 		{"tools", e.Tools},
 		{"sys", e.Instructions},
-		{"ascii", e.ASCIIBytes},
-		{"nonascii", e.NonASCIIBytes},
+		{"ascii", e.Bytes.ascii},
+		{"nonascii", e.Bytes.nonASCII()},
+		// Broken out because the three non-ASCII widths are priced differently
+		// and a drift query needs to know which one moved.
+		{"utf2", e.Bytes.twoByte},
+		{"utf3", e.Bytes.threeByte},
+		{"utf4", e.Bytes.fourByte},
 		{"mediab", e.MediaBytes},
 		{"text", e.Text},
 		{"frame", e.Framing},

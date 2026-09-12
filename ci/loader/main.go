@@ -29,14 +29,31 @@ import (
 	"github.com/maximhq/bifrost/core/schemas"
 )
 
-// required mirrors framework/plugins/soloader.go: GetName and Cleanup must
-// exist, every other hook is optional. Keep this list in sync with the symbols
-// the plugin actually exports.
-var required = []string{"GetName", "Cleanup"}
+// required is what THIS plugin must export for its feature to work, which is a
+// stricter list than the loader's own.
+//
+// framework/plugins/soloader.go only insists on GetName and Cleanup and looks
+// every other hook up OPTIONALLY — a hook whose name or signature drifted is
+// silently skipped and the plugin loads reporting healthy. That is precisely
+// the failure this harness exists to catch, so a hook this plugin depends on
+// belongs here and not in `optional`: listing it as optional makes the check
+// pass while the feature is gone.
+//
+// HTTPTransportPreHook is required because without it there is no raw-body
+// measurement and every estimate silently falls back to serializing the parsed
+// payload — slower, and a different measurement than the constants were
+// calibrated against.
+var required = []string{
+	"GetName",
+	"Cleanup",
+	"Init",
+	"PreRequestHook",
+	"HTTPTransportPreHook",
+}
 
 // optional hooks are reported but not enforced, so the harness stays useful for
 // a plugin that implements a different subset.
-var optional = []string{"Init", "PreRequestHook"}
+var optional = []string{}
 
 func main() {
 	if len(os.Args) != 2 {

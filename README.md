@@ -91,8 +91,11 @@ of them and not just the total.
 | `x-ctxlen-msgs` | Number of messages in the prompt. |
 | `x-ctxlen-tools` | Number of tool definitions sent with the request. |
 | `x-ctxlen-sys` | 1 when system instructions are present, else 0 (Responses API only). |
-| `x-ctxlen-ascii` | ASCII bytes of the serialized prompt, media already excluded. |
-| `x-ctxlen-nonascii` | Non-ASCII bytes. High means non-Latin text — Cyrillic, CJK. |
+| `x-ctxlen-ascii` | ASCII bytes of the prompt, media already excluded. |
+| `x-ctxlen-nonascii` | All non-ASCII bytes (sum of the three below). |
+| `x-ctxlen-utf2` | 2-byte UTF-8 (Cyrillic, Greek, Hebrew). |
+| `x-ctxlen-utf3` | 3-byte UTF-8 (CJK, kana, Hangul). |
+| `x-ctxlen-utf4` | 4-byte UTF-8 (emoji, rare CJK). |
 | `x-ctxlen-mediab` | Bytes that were excluded as media and priced by modality instead. |
 | `x-ctxlen-text` | Tokens attributed to text. |
 | `x-ctxlen-frame` | Tokens attributed to per-message framing (`msgs` × 3). |
@@ -190,16 +193,31 @@ what providers actually billed for 12 real requests the flat divisor came out
 **30-39% low** — the dangerous direction, because a request that looks small
 gets routed to a short-context provider and fails mid-session.
 
-| Byte class | Bytes per token |
-|---|---|
-| ASCII | 2.55 |
-| non-ASCII | 3.85 |
-| per message | +3 tokens of framing |
+Non-ASCII is split further by **UTF-8 sequence length**, because bytes-per-token
+is not one number across scripts — measured across FLORES-200 it ranges about
+4.5x, and a single non-ASCII divisor misprices whichever script it was not
+fitted to:
 
-3.85 bytes per non-ASCII token is 1.93 *characters* per token for two-byte
-Cyrillic, which independently matches the 1.5-2 chars/token that o200k is
-documented to reach on Russian. Worst-case error over the corpus is **3.7%**,
-against 39% before.
+| Byte class | Bytes per token | Measured range |
+|---|---|---|
+| ASCII | 2.55 | ~4-4.9 (prose); denser for code and JSON |
+| 2-byte — Cyrillic, Greek | 3.85 | 4.3 (cl100k) – 5.8 (o200k) |
+| 3-byte — CJK, kana, Hangul | 2.5 | 2.1 – 4.5 |
+| 4-byte — emoji | 1.5 | 1.3 – 2.0 |
+| per message | +3 tokens of framing | OpenAI cookbook |
+
+Each constant sits at or below the low end of its measured range, so the
+estimate errs **high** in tokens. That is the safe direction: overestimating
+routes a request to a long-context provider that could have been cheaper, while
+underestimating sends an oversized request to a short-context one and fails it
+mid-session.
+
+Emoji are the cheapest text there is per byte — a ZWJ sequence like 👨‍👩‍👧‍👦 has no
+single token and shatters into byte fragments — which is why they get their own
+class rather than being lumped with two-byte Cyrillic.
+
+Worst-case error over the calibration corpus is **3.7%**, against 39% before the
+byte classes existed.
 
 **Non-text parts are priced by modality, not by bytes.** No provider bills an
 image by the characters that carried it: OpenAI charges 85 tokens at

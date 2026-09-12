@@ -1,0 +1,26 @@
+{
+  "$schema": "https://www.getbifrost.ai/schema",
+  "config_store": {
+    "enabled": true,
+    "type": "sqlite",
+    "config": { "path": "/app/config/config.db" }
+  },
+  "logs_store": {
+    "enabled": true,
+    "type": "sqlite",
+    "config": { "path": "/app/config/logs.db" }
+  },
+  "client": {
+    "enable_logging": true,
+    "enforce_auth_on_inference": false
+  },
+  "plugins": [
+    {
+      "name": "ctxlen",
+      "path": "/app/plugins/bifrost-ctxlen.so",
+      "placement": "pre_builtin",
+      "enabled": true,
+      "config": { "header": "x-ctx-tokens", "required": true }
+    }
+  ]
+}

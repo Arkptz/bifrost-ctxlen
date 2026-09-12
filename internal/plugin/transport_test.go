@@ -140,6 +140,49 @@ func TestTransportHookSkipsNonInferencePaths(t *testing.T) {
 	}
 }
 
+// TestUnretainedBodyFallsBackToSerializing is the regression for the worst
+// underestimate this plugin can produce.
+//
+// The decompression middleware DELETES Content-Length before the transport
+// decides whether to retain the body, so a gzipped or chunked request arrives
+// with neither. Treating that as an empty body published a three-token estimate
+// for a payload worth hundreds of thousands — and an underestimate is what
+// routes a huge request to a short-context provider.
+func TestUnretainedBodyFallsBackToSerializing(t *testing.T) {
+	t.Parallel()
+
+	p := New()
+	req := chatRequest(50_000)
+
+	root := schemas.NewBifrostContext(t.Context(), time.Now())
+	name := Name
+	transportCtx := root.WithPluginScope(&name)
+
+	// No body, no content-length: exactly what gzip/chunked leaves behind.
+	if _, err := p.HTTPTransportPreHook(transportCtx, &schemas.HTTPRequest{
+		Path:    "/v1/chat/completions",
+		Headers: map[string]string{},
+		Body:    nil,
+	}); err != nil {
+		t.Fatalf("HTTPTransportPreHook() = %v", err)
+	}
+	transportCtx.ReleasePluginScope()
+
+	preCtx := root.WithPluginScope(&name)
+	if err := p.PreRequestHook(preCtx, req); err != nil {
+		t.Fatalf("PreRequestHook() = %v", err)
+	}
+	headers, _ := preCtx.Value(schemas.BifrostContextKeyRequestHeaders).(map[string]string)
+	got, _ := strconv.ParseInt(headers[p.Header()], 10, 64)
+
+	// It must land near what serializing would say, not near zero.
+	want := p.EstimateTokens(req)
+	if got < want/2 {
+		t.Errorf("estimate=%d for an unretained body, want ~%d: an unmeasured body "+
+			"read as an empty one", got, want)
+	}
+}
+
 func TestTransportHookFallsBackToContentLength(t *testing.T) {
 	t.Parallel()
 
@@ -199,12 +242,49 @@ func TestBodyMeasurementMatchesByteClasses(t *testing.T) {
 	body := []byte(`{"messages":[{"role":"user","content":"` +
 		strings.Repeat("x", 500) + strings.Repeat("я", 300) + `"}]}`)
 
-	ascii, nonASCII := countByteClasses(body)
-	// 300 Cyrillic runes, two bytes each.
-	if nonASCII != 600 {
-		t.Errorf("nonASCII = %d, want 600 (300 two-byte runes)", nonASCII)
+	c := countByteClasses(body)
+	// 300 Cyrillic runes, two bytes each, land in the two-byte bucket.
+	if c.twoByte != 600 {
+		t.Errorf("twoByte = %d, want 600 (300 two-byte runes)", c.twoByte)
 	}
-	if ascii != int64(len(body))-600 {
-		t.Errorf("ascii = %d, want %d", ascii, int64(len(body))-600)
+	if c.nonASCII() != 600 {
+		t.Errorf("nonASCII() = %d, want 600", c.nonASCII())
+	}
+	if c.ascii != int64(len(body))-600 {
+		t.Errorf("ascii = %d, want %d", c.ascii, int64(len(body))-600)
+	}
+	// The buckets must sum to the buffer length, or bytes went missing.
+	if c.total() != int64(len(body)) {
+		t.Errorf("total() = %d, want %d", c.total(), len(body))
+	}
+}
+
+// TestByteClassesByWidth pins that CJK and emoji land in the 3- and 4-byte
+// buckets, not lumped with 2-byte Cyrillic — the fix for F6-b, where one
+// non-ASCII divisor mispriced whichever script it was not fitted to.
+func TestByteClassesByWidth(t *testing.T) {
+	t.Parallel()
+
+	c := countByteClasses([]byte("x" + "я" + "中" + "😀"))
+	if c.ascii != 1 {
+		t.Errorf("ascii = %d, want 1", c.ascii)
+	}
+	if c.twoByte != 2 {
+		t.Errorf("twoByte = %d, want 2 (я)", c.twoByte)
+	}
+	if c.threeByte != 3 {
+		t.Errorf("threeByte = %d, want 3 (中)", c.threeByte)
+	}
+	if c.fourByte != 4 {
+		t.Errorf("fourByte = %d, want 4 (😀)", c.fourByte)
+	}
+
+	// Same character count, but by byte class an emoji prices higher than an
+	// ASCII char, and a CJK char higher than Cyrillic — the whole point.
+	emoji := priceText(byteClasses{fourByte: 4})
+	cjk := priceText(byteClasses{threeByte: 3})
+	cyr := priceText(byteClasses{twoByte: 2})
+	if emoji < cjk || cjk < cyr {
+		t.Errorf("per-char token cost should rise emoji>=cjk>=cyrillic, got %d/%d/%d", emoji, cjk, cyr)
 	}
 }

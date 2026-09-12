@@ -6,12 +6,17 @@
 # Run it and watch the bifrost logs: a version mismatch shows up as
 # "plugin was built with a different version of package ...".
 #
-#   docker compose up --build
+#   BIFROST_IMAGE=your/dynamic-bifrost:tag docker compose up --build
 #
-# BIFROST_IMAGE must be an image built from the SAME core version as go.mod
-# (and a non-static one — a statically linked Go binary cannot dlopen at all).
-# The default tag is a starting point, not a guarantee; check with
-# `go version -m` inside the image before trusting a green run.
+# BIFROST_IMAGE IS REQUIRED and has no working default. It must be an image that
+# is (1) built from the SAME core version as go.mod and (2) DYNAMICALLY linked.
+# The published `maximhq/bifrost` images are statically linked — upstream's
+# Dockerfile builds with `-extldflags '-static'` — and a static Go binary cannot
+# dlopen a plugin AT ALL, so pointing this at a published tag guarantees the
+# stand fails, not that it works. There is no digest we could pin here that
+# would; the gateway you actually deploy against has to be built dynamically
+# (this repo's own Dockerfile artifact stage, or your fleet's build). Supply
+# that image. Verify it first:  go version -m <image>:/app/bifrost-http | grep static
 
 services:
   plugin-build:
@@ -26,7 +31,9 @@ services:
     restart: "no"
 
   bifrost:
-    image: ${BIFROST_IMAGE:-maximhq/bifrost:latest@sha256:9e65eb4d0b292c25aaf46d194c705344f19c833a29e30155038bbe551eac7245}
+    # No default on purpose: `?` makes compose refuse to start with a clear
+    # message instead of pulling a static image that can never load a plugin.
+    image: ${BIFROST_IMAGE:?set BIFROST_IMAGE to a DYNAMICALLY linked bifrost built from the same core version as go.mod; published maximhq/bifrost images are static and cannot dlopen}
     depends_on:
       plugin-build:
         condition: service_completed_successfully

@@ -62,6 +62,23 @@ func TestInitDefaults(t *testing.T) {
 	}
 }
 
+// TestInitLowercasesHeader pins the F2 fix: a mixed-case configured name must be
+// stored lowercased, so the plugin's write lands on the same map entry the
+// routing engine's key-normalisation produces — otherwise a client's own
+// header of the canonical case survives beside ours and can win the routing
+// decision.
+func TestInitLowercasesHeader(t *testing.T) {
+	t.Parallel()
+
+	p := New()
+	if err := p.Init(map[string]any{"header": "X-Ctx-Tokens"}); err != nil {
+		t.Fatalf("Init() = %v", err)
+	}
+	if got := p.Header(); got != "x-ctx-tokens" {
+		t.Errorf("Header() = %q, want it lowercased to x-ctx-tokens", got)
+	}
+}
+
 func TestInitAppliesConfig(t *testing.T) {
 	t.Parallel()
 

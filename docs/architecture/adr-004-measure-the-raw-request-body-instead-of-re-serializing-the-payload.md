@@ -27,7 +27,7 @@ The transport layer hands a plugin those bytes: `fasthttpToHTTPRequest` copies t
 
 Measuring the wire body is not identical to measuring a marshal: the body carries top-level request parameters and the client's own JSON escaping rather than Go's. Priced against billed tokens over the calibration corpus the two agree to within hundredths of a percent — JSON escaping never touches valid non-ASCII, and the ASCII overhead is a stable fraction the constants absorb — and the non-ASCII split, which the whole estimator depends on, is byte-exact (`TestBodyMeasurementMatchesByteClasses`). The equivalence was verified before the switch, not assumed after it.
 
-One wrinkle: the transport does not retain every body. Payloads over the large-payload threshold (10 MB by default) and chunked requests of unknown length arrive with an empty `Body`; `Content-Length` is then the only signal.
+One wrinkle: the transport does not retain every body. Payloads over the large-payload threshold (10 MB by default) and requests of unknown length arrive with an empty `Body`. `Content-Length` is not a dependable substitute either — the decompression middleware DELETES that header before the retain decision is made, so a gzipped or chunked request arrives with neither a body nor a declared size. An absent body must therefore be distinguished from an empty one: treating the two alike published a three-token estimate for payloads worth hundreds of thousands, which is exactly the underestimate that routes an oversized request to a short-context provider.
 ## Decision
 
 (a) **`HTTPTransportPreHook` measures the raw body before Bifrost parses it.** One linear pass over the bytes, counting ASCII and non-ASCII — the units ADR-003 prices — with zero allocation. It measures and stashes only; the estimate is still published by `PreRequestHook`, which is where routing can see it.
@@ -38,7 +38,7 @@ One wrinkle: the transport does not retain every body. Payloads over the large-p
 
 (d) **Only inference paths are measured** (`/chat/completions`, `/responses`, `/messages`, `/generateContent`). The hook fires on every route the middleware covers, including the admin API; scanning a config write costs time and says nothing.
 
-(e) **A body that was not retained falls back to the declared `Content-Length`**, treated as ASCII. A request that large is above any sane routing threshold, so erring high is the safe direction; the alternative — reporting zero — is the misroute this plugin exists to prevent.
+(e) **A body that was not retained falls back to serializing**, not to the wire size. The transport hook records whether it actually counted the body; when it did not, `PreRequestHook` re-serializes the parsed payload rather than trust an absent `Content-Length`. Only if a declared length genuinely survives is it used, treated as ASCII so the estimate errs high. Reporting zero — the original behaviour — is the misroute this plugin exists to prevent.
 
 (f) **The hook never short-circuits.** It observes; returning a response would answer the request from a plugin whose job is to measure it.
 
@@ -54,5 +54,5 @@ The hot path no longer serializes anything: measured against the marshal it repl
 
 ### Negative
 - Two code paths exist forever, and they are only empirically equivalent — the wire body is not Go's serialization, so any change to what is measured needs the differential tests re-run.
-- Requests over the large-payload threshold lose the byte-class split: `Content-Length` is all there is, counted as ASCII.
+- Requests whose body was not retained lose the cheap path entirely and pay the marshal, which is the price of not guessing their size.
 - The fallback path keeps its marshal cost, so callers without a transport hook still pay it.

@@ -22,11 +22,14 @@ const bodySizeKey schemas.BifrostContextKey = "ctxlen-body-size"
 // ReleaseHTTPRequest nils Body as soon as the hook returns — holding the slice
 // would alias memory the next request is about to reuse.
 type bodySize struct {
-	ascii    int64
-	nonASCII int64
+	classes byteClasses
 	// contentLength is the client's declared size, used when the body itself
 	// was not retained. Negative when unknown.
 	contentLength int64
+	// measured records whether the body was actually counted. Without it, a
+	// body the transport declined to retain is indistinguishable from an empty
+	// one, and the estimate reads as ~0 for a request that may be enormous.
+	measured bool
 }
 
 // inferencePaths are the request paths worth measuring.
@@ -66,12 +69,17 @@ func (p *Plugin) HTTPTransportPreHook(ctx *schemas.BifrostContext, req *schemas.
 		}
 	}
 
-	// An empty body is not an error: the transport skips the copy for payloads
-	// over the large-payload threshold (10 MB by default) and for chunked
-	// requests whose length is unknown. Content-Length is then the only signal,
-	// and a request that large is above any sane routing threshold anyway.
+	// An absent body is not an error, but it IS unmeasurable, and the two must
+	// not be confused. The transport declines to copy a body when it exceeds
+	// the large-payload threshold (10 MB by default) or when its length is
+	// unknown — and the decompression middleware DELETES Content-Length before
+	// that decision, so a gzipped or chunked request arrives here with neither
+	// a body nor a declared size. Treating that as "empty" published a
+	// three-token estimate for payloads worth hundreds of thousands, which is
+	// the underestimate that routes a huge request to a short-context provider.
 	if len(req.Body) > 0 {
-		size.ascii, size.nonASCII = countByteClasses(req.Body)
+		size.classes = countByteClasses(req.Body)
+		size.measured = true
 	}
 
 	ctx.SetValue(bodySizeKey, &size)
