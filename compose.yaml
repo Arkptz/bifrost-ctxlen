@@ -23,7 +23,7 @@ services:
     build:
       context: .
       args:
-        GO_VERSION: ${GO_VERSION:-1.27.0}
+        GO_VERSION: ${GO_VERSION:-1.27.3}
         PLUGIN: ${PLUGIN:-bifrost-ctxlen}
     volumes:
       - plugins:/shared

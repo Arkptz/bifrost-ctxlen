@@ -38,10 +38,10 @@
         # constraint and this only costs a source build.
         go_1_27_0_overlay = final: prev: {
           go_1_27 = prev.go_1_27.overrideAttrs (_: rec {
-            version = "1.27.0";
+            version = "1.27.3";
             src = final.fetchurl {
               url = "https://go.dev/dl/go${version}.src.tar.gz";
-              sha256 = "7002403d7cc44529ef6d26f69a44818263395ead7c16c05a5808ae047ebeb0e5";
+              sha256 = "6e7749035cf360f06b2575d162ea79df9fda8ef671889e5c375f8e50777f26bb";
             };
           });
           go = final.go_1_27;
@@ -57,7 +57,7 @@
 
         # vendorHash covers the whole dependency tree. Refresh it with:
         #   nix build 2>&1 | grep 'got:' | awk '{print $2}'
-        vendorHash = "sha256-yGQhXLfUp1+kchmfK6dDyswyqSsvdFEAK9HRSlqoKUk=";
+        vendorHash = "sha256-k2AU3stVyu4//nb1U273/wBycCzPTIF3tQNsusvdsJU=";
       in {
         # `nix flake check` only EVALUATES packages.default — it never builds
         # it — so a check that does not depend on the package is green while

@@ -2,8 +2,8 @@
 
 ## Stack
 
-- Language: Go 1.27.0 (pinned via the `go.mod` `go` directive + a Nix overlay that
-  builds the real 1.27.0 — nixpkgs still ships a release candidate)
+- Language: Go 1.27.3 (pinned via the `go.mod` `go` directive + a Nix overlay that
+  builds the real 1.27.3 — nixpkgs still ships a release candidate)
 - Artifact: a `-buildmode=plugin` shared object, `dlopen`ed by `bifrost-http`
 - Purpose: estimate request context size and record it as a header, so Bifrost's
   CEL routing rules can match on it (`headers["x-ctx-large"] == "1"`)

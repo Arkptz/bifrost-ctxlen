@@ -8,7 +8,7 @@
 # plugin.Open refuse the result.
 #
 # ARG so the compose stand and CI can pin one version in one place.
-ARG GO_VERSION=1.27.0
+ARG GO_VERSION=1.27.3
 ARG PLUGIN=bifrost-plugin
 
 FROM golang:${GO_VERSION}-bookworm AS build
