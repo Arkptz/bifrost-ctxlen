@@ -46,16 +46,16 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      # golangci-lint refuses to analyse a module whose `go` directive is newer
-      # than the Go release its own binary was built with, and this module
-      # targets 1.27.0 because bifrost's modules do. v2.6.2 is built with Go
-      # 1.25 and bails out with "the Go language version used to build
-      # golangci-lint is lower than the targeted Go version"; v2.13.2 is built
-      # with 1.27.0 — verified with `go version` on the released binary — so the
-      # floor is met by using a current release rather than working around it.
+      # The released golangci-lint binaries are built with Go 1.27.0, whose
+      # export-data reader cannot decode the stdlib of a newer toolchain:
+      # against Go 1.27.3 every import fails with "export data version 5 is
+      # greater than maximum supported version 4". goinstall builds the linter
+      # with the job's own toolchain (go.mod's), so the two always agree.
+      # v2.13.2 still fails even when built this way; v2.15.0 passes.
       - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
-          version: v2.13.2
+          version: v2.15.0
+          install-mode: goinstall
 
   test:
     name: go test -race
