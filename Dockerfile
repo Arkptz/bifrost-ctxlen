@@ -36,7 +36,7 @@ RUN /out/loader /out/${PLUGIN}.so
 # Debian rather than scratch so the glibc under the .so matches what a
 # Debian-based bifrost image provides. A plugin linked against a different libc
 # than the process loading it is undefined behaviour, not a version warning.
-FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS artifact
+FROM debian:bookworm-slim@sha256:e67eeead736ff7bbe258ef088bff683635c561b1fcfefad0806c1df4ab49ce0e AS artifact
 ARG PLUGIN
 COPY --from=build /out/${PLUGIN}.so /plugins/${PLUGIN}.so
 
